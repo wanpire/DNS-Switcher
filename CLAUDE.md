@@ -207,7 +207,10 @@ inside `execute_single_switch` is caught and logged internally rather than
 raised, so its `AuditLogEntry(status=failed)` still commits normally.
 `GET /datacenters` was added beyond the phase's original endpoint list —
 without it AloBot has no way to know which datacenters exist to offer as
-switch targets.
+switch targets. `GET /domains` was added the same way in Phase 4, once
+AloBot's single-switch flow ("pick a domain → list its DnsTargets") turned
+out to have no way to list domains at all — `DomainOut` already existed in
+`app/schemas/switch.py` from Phase 3 but had never been wired to a route.
 
 Covered by `tests/test_switch_service.py` (plan/execute/rollback, the
 skip-when-already-correct idempotency path, bulk partial-failure
@@ -216,3 +219,7 @@ through the actual HTTP router) — 43 tests passing in total. Verified
 end-to-end in the real docker-compose stack: all three migrations apply in
 sequence, and `/switch/single/plan` against manually-inserted data
 produces the correct diff with zero Cloudflare calls.
+
+Phase 4 (built in the sibling AloBot repo, not here): added `GET /domains`
+to this service's API — see the note above — while wiring up the Telegram
+bot's "مدیریت DNS" module.

@@ -100,6 +100,10 @@ async def test_list_targets_groups_datacenters(session, api_client):
     assert dc_resp.json()[0]["ip_address"] == "1.1.1.1"
     assert dc_resp.json()[0]["status"] == "active"
 
+    domains_resp = await api_client.get("/domains", headers=headers)
+    assert domains_resp.status_code == 200
+    assert domains_resp.json()[0]["name"] == "example.com"
+
 
 @respx.mock
 async def test_plan_and_execute_single_switch_via_api(session, api_client):

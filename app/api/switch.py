@@ -6,7 +6,7 @@ from sqlalchemy.orm import selectinload
 from app.api.deps import get_cloudflare_client, verify_internal_secret
 from app.cloudflare.client import CloudflareClient
 from app.db.session import get_db
-from app.models import AuditLogEntry, Datacenter, DnsTarget, SwitchGroup
+from app.models import AuditLogEntry, Datacenter, DnsTarget, Domain, SwitchGroup
 from app.schemas.switch import (
     AuditLogPageOut,
     BulkSwitchExecuteRequest,
@@ -14,6 +14,7 @@ from app.schemas.switch import (
     BulkSwitchPlanRequest,
     DatacenterOut,
     DnsTargetOut,
+    DomainOut,
     RollbackRequest,
     SingleSwitchExecuteRequest,
     SingleSwitchPlanRequest,
@@ -34,6 +35,12 @@ def _to_execution_out(result) -> SwitchExecutionOut:
         error_message=result.error_message,
         audit_log_entry_id=result.audit_log_entry.id if result.audit_log_entry else None,
     )
+
+
+@router.get("/domains", response_model=list[DomainOut])
+async def list_domains(session: AsyncSession = Depends(get_db)):
+    result = await session.execute(select(Domain))
+    return result.scalars().all()
 
 
 @router.get("/targets", response_model=list[DnsTargetOut])
