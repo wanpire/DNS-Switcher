@@ -7,6 +7,7 @@ WORKDIR /srv/app
 
 COPY pyproject.toml ./
 COPY app ./app
+COPY scripts ./scripts
 COPY alembic ./alembic
 COPY alembic.ini ./
 

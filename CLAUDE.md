@@ -100,7 +100,51 @@ alembic/       migrations
 tests/
 ```
 
+## ON DELETE behavior
+
+Beyond the explicit rule that deleting a referenced Datacenter must be
+restricted, the other foreign keys follow this reasoning:
+
+- `dns_targets.domain_id → domains.id`: **RESTRICT**. A Domain going away
+  should never silently wipe out its DnsTargets (and their audit trail);
+  targets must be removed explicitly first.
+- `dns_targets.current_datacenter_id → datacenters.id`: **RESTRICT** (the
+  explicit rule).
+- `audit_log_entries.previous_datacenter_id` / `.new_datacenter_id →
+  datacenters.id`: **RESTRICT** — audit history must never lose which
+  datacenter was involved in a past switch.
+- `switch_group_members.switch_group_id → switch_groups.id`: **CASCADE**.
+  Deleting a group just disbands it; the membership rows are structural,
+  not data worth preserving on their own.
+- `switch_group_members.dns_target_id → dns_targets.id`: **CASCADE**, same
+  reasoning — a deleted target can't remain a group member.
+- `audit_log_entries.dns_target_id → dns_targets.id` and
+  `audit_log_entries.switch_group_id → switch_groups.id`: **SET NULL**
+  (both columns are nullable for exactly this reason) — the audit row
+  survives deletion of the target/group it once referenced.
+
+## Testing
+
+Model and integration tests need a real Postgres (SQLite can't enforce the
+native enum types or the RESTRICT/CASCADE/SET NULL behavior these tests
+verify). Point `TEST_DATABASE_URL` at a scratch database — e.g. run
+`docker compose up -d db` and use
+`postgresql+asyncpg://dns_switcher:dns_switcher@localhost:5432/dns_switcher_test`
+(create that database once with `CREATE DATABASE dns_switcher_test;`, since
+`docker-compose.yml`'s `db` service doesn't publish 5432 to the host by
+default). Each test gets a fresh schema via `create_all`/`drop_all` in
+`tests/conftest.py`.
+
 ## Status
 
-Phase 0 (this scaffold): project structure, config, DB session wiring, and a
-`/health` endpoint that reports DB connectivity. No business logic yet.
+Phase 0: project structure, config, DB session wiring, and a `/health`
+endpoint that reports DB connectivity.
+
+Phase 1: SQLAlchemy models for the full data model (`app/models/`), the
+initial Alembic migration (verified with a real upgrade → downgrade →
+upgrade cycle against Postgres, including explicit `DROP TYPE` for the
+Postgres enums in `downgrade()`, which autogenerate does not emit on its
+own), `scripts/seed.py` for upserting domains/datacenters from a YAML file
+or interactively, and model-level tests in `tests/test_models.py` covering
+every constraint and cascade path above. No business logic yet — Cloudflare
+sync and switch operations are Phase 2+.

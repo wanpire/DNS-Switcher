@@ -7,6 +7,7 @@ from sqlalchemy.engine import Connection
 
 from app.core.config import get_settings
 from app.db.session import Base
+from app import models  # noqa: F401 - registers all models on Base.metadata
 
 # Alembic Config object, giving access to values in alembic.ini.
 config = context.config

@@ -1,0 +1,16 @@
+# Copy to scripts/seed.local.yaml (gitignored) and fill in real values, then:
+#   python -m scripts.seed --file scripts/seed.local.yaml
+
+domains:
+  - name: example.com # PLACEHOLDER — replace with your first domain
+    cloudflare_zone_id: PLACEHOLDER_ZONE_ID_1
+  - name: example.net # PLACEHOLDER — replace with your second domain
+    cloudflare_zone_id: PLACEHOLDER_ZONE_ID_2
+
+datacenters:
+  - name: dc-primary # PLACEHOLDER — replace with your real datacenter name
+    status: active
+    notes: Primary datacenter
+  - name: dc-secondary # PLACEHOLDER
+    status: standby
+    notes: Standby / failover datacenter
