@@ -34,17 +34,24 @@ async def upsert_domain(session: AsyncSession, name: str, cloudflare_zone_id: st
 
 
 async def upsert_datacenter(
-    session: AsyncSession, name: str, status: str, notes: str | None
+    session: AsyncSession,
+    name: str,
+    status: str,
+    notes: str | None,
+    ip_address: str | None = None,
 ) -> Datacenter:
     result = await session.execute(select(Datacenter).where(Datacenter.name == name))
     datacenter = result.scalar_one_or_none()
     if datacenter is None:
-        datacenter = Datacenter(name=name, status=DatacenterStatus(status), notes=notes)
+        datacenter = Datacenter(
+            name=name, status=DatacenterStatus(status), notes=notes, ip_address=ip_address
+        )
         session.add(datacenter)
         print(f"  + datacenter {name} ({status})")
     else:
         datacenter.status = DatacenterStatus(status)
         datacenter.notes = notes
+        datacenter.ip_address = ip_address
         print(f"  = datacenter {name} (updated)")
     return datacenter
 
@@ -56,7 +63,11 @@ async def seed_from_file(path: Path) -> None:
             await upsert_domain(session, d["name"], d["cloudflare_zone_id"])
         for dc in data.get("datacenters", []):
             await upsert_datacenter(
-                session, dc["name"], dc.get("status", "active"), dc.get("notes")
+                session,
+                dc["name"],
+                dc.get("status", "active"),
+                dc.get("notes"),
+                dc.get("ip_address"),
             )
         await session.commit()
 
@@ -83,8 +94,9 @@ async def seed_interactive() -> None:
             if not name:
                 break
             status = _prompt("  status (active|standby|disabled)", "active")
+            ip_address = _prompt("  ip_address") or None
             notes = _prompt("  notes") or None
-            await upsert_datacenter(session, name, status, notes)
+            await upsert_datacenter(session, name, status, notes, ip_address)
 
         await session.commit()
     print("Done.")

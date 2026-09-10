@@ -25,6 +25,7 @@ class Datacenter(Base):
         server_default=DatacenterStatus.active.value,
     )
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    ip_address: Mapped[str | None] = mapped_column(String(45), nullable=True)
 
     dns_targets: Mapped[list["DnsTarget"]] = relationship(
         back_populates="current_datacenter"

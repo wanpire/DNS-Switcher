@@ -30,7 +30,7 @@ docker-compose, separate from any other service on the host.
 ## Data model
 
 - **Datacenter**: `id`, `name` (unique), `status` (active | standby |
-  disabled), `notes`
+  disabled), `notes`, `ip_address` (nullable — added in Phase 2; see below)
 - **Domain**: `id`, `name` (e.g. `example.com`), `cloudflare_zone_id`
 - **DnsTarget**: `id`, `domain_id` (FK), `name` (subdomain or `@` for root),
   `record_type` (A | AAAA | CNAME), `cloudflare_record_id` (nullable until
@@ -51,6 +51,12 @@ pointers must never silently lose their target.
 
 This model is implemented starting in Phase 1; this scaffold (Phase 0) has
 no models yet.
+
+`Datacenter.ip_address` was added in Phase 2, not Phase 1: reconciling what
+Cloudflare actually reports for a record against our notion of "which
+datacenter is this pointing at" requires knowing each datacenter's IP, and
+the original Phase 1 field list omitted it. It's nullable since a
+Datacenter can exist before its IP is known.
 
 ## Cloudflare rate limits — respect these everywhere
 
@@ -148,3 +154,17 @@ own), `scripts/seed.py` for upserting domains/datacenters from a YAML file
 or interactively, and model-level tests in `tests/test_models.py` covering
 every constraint and cascade path above. No business logic yet — Cloudflare
 sync and switch operations are Phase 2+.
+
+Phase 2: `app/cloudflare/client.py` — an async Cloudflare API v4 client
+(`list_dns_records`, `get_dns_record`, `update_dns_record`,
+`create_dns_record`) that retries on HTTP 429 (honoring `Retry-After`) and
+5xx with backoff via `tenacity`, and raises `CloudflareApiError` (with the
+raw Cloudflare error payload attached) for anything else or once retries
+are exhausted. Also `app/services/sync_service.py`'s `SyncService`, which
+reconciles a Domain's DnsTargets against Cloudflare: fills in missing
+`cloudflare_record_id` by matching name+type, and flags (without
+auto-fixing) any DnsTarget whose `current_datacenter_id` doesn't match the
+datacenter that record's `content` resolves to via `ip_address`. Both are
+covered by respx-mocked tests (`tests/test_cloudflare_client.py`,
+`tests/test_sync_service.py`) including the 429-retry and
+permanent-failure paths.

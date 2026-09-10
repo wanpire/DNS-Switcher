@@ -10,7 +10,9 @@ domains:
 datacenters:
   - name: dc-primary # PLACEHOLDER — replace with your real datacenter name
     status: active
+    ip_address: 203.0.113.1 # PLACEHOLDER — replace with the real IP
     notes: Primary datacenter
   - name: dc-secondary # PLACEHOLDER
     status: standby
+    ip_address: 203.0.113.2 # PLACEHOLDER
     notes: Standby / failover datacenter
