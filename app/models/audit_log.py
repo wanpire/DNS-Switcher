@@ -36,8 +36,8 @@ class AuditLogEntry(Base):
     switch_group_id: Mapped[int | None] = mapped_column(
         ForeignKey("switch_groups.id", ondelete="SET NULL"), nullable=True, index=True
     )
-    previous_datacenter_id: Mapped[int] = mapped_column(
-        ForeignKey("datacenters.id", ondelete="RESTRICT"), nullable=False
+    previous_datacenter_id: Mapped[int | None] = mapped_column(
+        ForeignKey("datacenters.id", ondelete="RESTRICT"), nullable=True
     )
     new_datacenter_id: Mapped[int] = mapped_column(
         ForeignKey("datacenters.id", ondelete="RESTRICT"), nullable=False
@@ -47,8 +47,12 @@ class AuditLogEntry(Base):
         SAEnum(AuditStatus, name="audit_status"), nullable=False
     )
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    rollback_of_id: Mapped[int | None] = mapped_column(
+        ForeignKey("audit_log_entries.id", ondelete="SET NULL"), nullable=True, index=True
+    )
 
     dns_target: Mapped["DnsTarget | None"] = relationship()
     switch_group: Mapped["SwitchGroup | None"] = relationship()
-    previous_datacenter: Mapped["Datacenter"] = relationship(foreign_keys=[previous_datacenter_id])
+    previous_datacenter: Mapped["Datacenter | None"] = relationship(foreign_keys=[previous_datacenter_id])
     new_datacenter: Mapped["Datacenter"] = relationship(foreign_keys=[new_datacenter_id])
+    rollback_of: Mapped["AuditLogEntry | None"] = relationship(remote_side=[id])

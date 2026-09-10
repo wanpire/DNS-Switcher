@@ -20,6 +20,7 @@ class Settings(BaseSettings):
 
     # Misc
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
+    bulk_switch_delay_seconds: float = Field(default=0.3, alias="BULK_SWITCH_DELAY_SECONDS")
 
 
 @lru_cache

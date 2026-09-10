@@ -41,9 +41,10 @@ docker-compose, separate from any other service on the host.
   table
 - **AuditLogEntry**: `id`, `created_at`, `actor` (Telegram user id/username),
   `action_type` (single | bulk | rollback), `dns_target_id` (nullable FK),
-  `switch_group_id` (nullable FK), `previous_datacenter_id`,
-  `new_datacenter_id`, `cloudflare_record_id`, `status` (success | failed |
-  rolled_back), `error_message` (nullable)
+  `switch_group_id` (nullable FK), `previous_datacenter_id` (nullable FK —
+  see Phase 3 note below), `new_datacenter_id`, `cloudflare_record_id`,
+  `status` (success | failed | rolled_back), `error_message` (nullable),
+  `rollback_of_id` (nullable, self-referential FK — added in Phase 3)
 
 Deleting a Datacenter that is still referenced (by a DnsTarget or an
 AuditLogEntry) must be restricted, not cascaded — history and current
@@ -57,6 +58,18 @@ Cloudflare actually reports for a record against our notion of "which
 datacenter is this pointing at" requires knowing each datacenter's IP, and
 the original Phase 1 field list omitted it. It's nullable since a
 Datacenter can exist before its IP is known.
+
+Two more fixes landed in Phase 3, once the switch/rollback logic exposed
+gaps in the Phase 1 field list:
+
+- `previous_datacenter_id` was originally `NOT NULL`, but a DnsTarget's
+  very first switch has no prior datacenter to record (it may never have
+  been assigned one) — it's nullable now.
+- `rollback_of_id` (nullable, FK to `audit_log_entries.id`, `ON DELETE SET
+  NULL`) was added so a rollback's audit entry can reference the original
+  entry it's undoing, per the explicit requirement that rollback "logs a
+  new AuditLogEntry that references the original entry" — there was no
+  field for that link before.
 
 ## Cloudflare rate limits — respect these everywhere
 
@@ -168,3 +181,38 @@ datacenter that record's `content` resolves to via `ip_address`. Both are
 covered by respx-mocked tests (`tests/test_cloudflare_client.py`,
 `tests/test_sync_service.py`) including the 429-retry and
 permanent-failure paths.
+
+Phase 3: `app/services/switch_service.py`'s `SwitchService` — single and
+bulk switching with dry-run plans and rollback. `plan_single_switch` never
+calls Cloudflare (pure DB diff: current datacenter's `ip_address` → target
+datacenter's `ip_address`); `execute_single_switch` always re-derives its
+own plan internally (never trusts a caller-supplied diff), then checks
+Cloudflare's *live* record content before writing — an already-correct
+record is a no-op that's still logged. `execute_bulk_switch` runs targets
+sequentially with `BULK_SWITCH_DELAY_SECONDS` (default 0.3s) between
+Cloudflare calls, continuing past a per-target failure and returning a
+succeeded/failed summary. `rollback` re-executes a switch back to
+`previous_datacenter_id`, links the new entry via `rollback_of_id`, and
+flips the original entry's status to `rolled_back` only once the reversal
+actually succeeds.
+
+The internal API lives in `app/api/switch.py`, guarded by
+`verify_internal_secret` (checks `X-Internal-Secret` against
+`INTERNAL_API_SHARED_SECRET` with a constant-time comparison; missing and
+wrong values both come back as a plain 401, not FastAPI's default 422 for
+a missing header) on every route. `app/db/session.get_db` now
+commits on a clean request and rolls back on any exception, so routes
+don't need to call `session.commit()` themselves — a Cloudflare failure
+inside `execute_single_switch` is caught and logged internally rather than
+raised, so its `AuditLogEntry(status=failed)` still commits normally.
+`GET /datacenters` was added beyond the phase's original endpoint list —
+without it AloBot has no way to know which datacenters exist to offer as
+switch targets.
+
+Covered by `tests/test_switch_service.py` (plan/execute/rollback, the
+skip-when-already-correct idempotency path, bulk partial-failure
+tolerance) and `tests/test_switch_api.py` (auth, and the same flows
+through the actual HTTP router) — 43 tests passing in total. Verified
+end-to-end in the real docker-compose stack: all three migrations apply in
+sequence, and `/switch/single/plan` against manually-inserted data
+produces the correct diff with zero Cloudflare calls.
