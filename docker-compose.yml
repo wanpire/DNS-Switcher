@@ -1,0 +1,46 @@
+services:
+  dns-switcher:
+    build: .
+    container_name: dns-switcher
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://dns_switcher:dns_switcher@db:5432/dns_switcher
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - dns-switcher-net
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  db:
+    image: postgres:16-alpine
+    container_name: dns-switcher-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: dns_switcher
+      POSTGRES_PASSWORD: dns_switcher
+      POSTGRES_DB: dns_switcher
+    volumes:
+      - dns-switcher-db-data:/var/lib/postgresql/data
+    networks:
+      - dns-switcher-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dns_switcher"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+networks:
+  dns-switcher-net:
+    name: dns-switcher-net
+
+volumes:
+  dns-switcher-db-data:
