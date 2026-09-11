@@ -1,7 +1,10 @@
-"""CSV-driven topology import: cross-checks a CSV (columns: domain,
-subdomain, record_type, service, farzanegan_ips, pishgaman_ips -- IPs
-comma-separated within a cell for load-balanced targets) against live
-Cloudflare DNS records, and reports which rows cleanly matched.
+"""CSV-driven topology import: cross-checks a CSV of the authoritative
+desired DNS topology against live Cloudflare DNS records, and reports
+which rows cleanly matched. See app/services/topology_import.py's
+docstring for the exact CSV shape (one row per candidate IP, grouped by
+(domain, subdomain, record_type); switch-group membership is derived from
+the subdomain name, not a column -- fully modular, a new subdomain in a
+future CSV needs no code change to get its own switch group).
 
 Always read-only unless --apply is passed. Review the report first --
 --apply only writes rows that matched cleanly (status "matched"); anything
@@ -27,15 +30,13 @@ from app.services.topology_import import (
     parse_csv,
 )
 
-GROUP_NAMES = ["L2TP", "Cisco", "Open", "Prime"]
-
 
 async def run(csv_path: Path, apply: bool) -> None:
-    csv_rows = parse_csv(csv_path)
-    print(f"Parsed {len(csv_rows)} rows from {csv_path}")
+    csv_targets = parse_csv(csv_path)
+    print(f"Parsed {len(csv_targets)} target(s) from {csv_path}")
 
     async with async_session_factory() as session, CloudflareClient() as client:
-        reports = await build_reconciliation_report(session, client, csv_rows)
+        reports = await build_reconciliation_report(session, client, csv_targets)
 
         print()
         print(format_report_table(reports))
@@ -52,7 +53,7 @@ async def run(csv_path: Path, apply: bool) -> None:
 
         result = await apply_topology(session, reports)
         await session.commit()
-        applied_count = sum(len(v) for v in result.applied_target_ids_by_service.values())
+        applied_count = sum(len(v) for v in result.applied_target_ids_by_group.values())
         print(f"\nApplied {applied_count} target(s).")
         if result.skipped_rows:
             print(
@@ -60,9 +61,7 @@ async def run(csv_path: Path, apply: bool) -> None:
                 "see the detail section above."
             )
 
-        groups = await create_switch_groups(
-            session, result.applied_target_ids_by_service, GROUP_NAMES
-        )
+        groups = await create_switch_groups(session, result.applied_target_ids_by_group)
         await session.commit()
         print(f"Created/updated {len(groups)} switch group(s): {[g.name for g in groups]}")
 

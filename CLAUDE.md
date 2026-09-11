@@ -293,3 +293,24 @@ add the CSV-driven reconciliation-then-seed workflow. 54 tests passing.
 (`current_content`/`new_content`), so deploying this dns-switcher version
 before AloBot's rendering is updated would break the live "🌐 مدیریت DNS"
 panel mid-use. Deploy both together, not this one alone.
+
+The real CSV, once provided, turned out to have a different shape than
+the first draft assumed: one row *per candidate IP*, not one row per
+target with IPs comma-joined in a single cell -- a load-balanced target is
+several consecutive rows sharing the same (domain, subdomain,
+record_type), row order = slot order. Columns after record_type are
+positional and variable-length (`service` is only present when the next
+field isn't a bare IPv4 address; a row may have only one IP column at all,
+e.g. a domain with no second datacenter configured yet). `parse_csv` in
+`app/services/topology_import.py` groups rows by that key rather than
+using `csv.DictReader` against a fixed header. Switch-group membership is
+derived from the *subdomain name* (not the `service` column, which turned
+out to be an informational server-pool label, not a group identifier) via
+`group_name_for_subdomain` -- deliberately data-driven rather than a
+hardcoded list, so a new subdomain in a future CSV gets its own switch
+group with no code change. Confirmed real cases this had to handle
+correctly: several subdomains with duplicate IP values across rows (real
+DNS-level load-balancing weighting, not a data error -- confirmed with the
+operator before assuming otherwise), and a domain with no second
+datacenter's IPs configured at all (an empty candidate list must never be
+treated as "fully matched").

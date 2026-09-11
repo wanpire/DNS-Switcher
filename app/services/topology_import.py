@@ -1,13 +1,29 @@
-"""CSV-driven topology import: read the authoritative desired DNS topology
-(domain, subdomain, record_type, service, farzanegan_ips, pishgaman_ips),
+"""CSV-driven topology import: read the authoritative desired DNS topology,
 cross-check it against live Cloudflare records, and report matched/
 not-matched/partial/ambiguous rows -- read-only. apply_topology() (never
 invoked automatically by this module) does the actual Domain/DnsTarget/
 TargetDatacenterIp/SwitchGroup writes for cleanly-matched rows only, after
 a human has reviewed the report.
+
+CSV shape: one row per (domain, subdomain, record_type) *candidate IP*, not
+one row per target -- a load-balanced target has several consecutive rows
+sharing the same (domain, subdomain, record_type), each contributing one
+IP per datacenter column present. Row order within a group is slot order.
+Columns after (domain, subdomain, record_type) are positional and
+variable-length:
+
+    domain,subdomain,record_type[,service][,<dc1_ip>[,<dc2_ip>]]
+
+`service` is present only when the field right after record_type is not a
+bare IPv4 address; when present it's an informational label only (e.g.
+"srv3") -- switch-group membership comes from the *subdomain*, not this
+column, so this format stays modular: a new subdomain automatically gets
+its own switch group with no code change. A row may have only one IP
+column at all (e.g. a domain with no second datacenter configured yet).
 """
 
 import csv
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -22,44 +38,112 @@ from app.services.sync_service import target_fqdn
 EMERGENCY_GROUP_NAME = "همه‌چیز (اورژانس کامل)"
 EMERGENCY_GROUP_DESCRIPTION = "Full emergency failover -- every managed target across all groups"
 
+# Subdomains excluded entirely -- constant-value records the operator does
+# not want touched by this tool at all.
+OUT_OF_SCOPE_SUBDOMAINS = {"admin"}
+
+# These subdomains all belong to one combined "Prime" switch group rather
+# than each getting their own -- the four georouted location variants plus
+# the main prime pointer itself.
+PRIME_GROUP_SUBDOMAINS = {"nl", "tr", "uk", "us", "prime"}
+PRIME_GROUP_NAME = "Prime"
+
+# Display-name overrides for well-known acronym subdomains; anything else
+# not listed here just gets its subdomain capitalized as its group name --
+# a new service subdomain needs no code change to get its own switch group.
+GROUP_DISPLAY_NAMES = {"l2tp": "L2TP", "sstp": "SSTP"}
+
+_IPV4_RE = re.compile(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$")
+
+
+def _looks_like_ip(value: str) -> bool:
+    return bool(_IPV4_RE.match(value))
+
+
+def group_name_for_subdomain(subdomain: str) -> str | None:
+    """None means "not part of any switch group" -- still imported as a
+    DnsTarget (unless also out of scope), just not bulk-switchable."""
+    key = subdomain.lower()
+    if key in OUT_OF_SCOPE_SUBDOMAINS:
+        return None
+    if key in PRIME_GROUP_SUBDOMAINS:
+        return PRIME_GROUP_NAME
+    return GROUP_DISPLAY_NAMES.get(key, subdomain.capitalize())
+
 
 @dataclass
-class CsvRow:
-    row_number: int
+class CsvTarget:
     domain: str
     subdomain: str
     record_type: str
-    service: str
-    farzanegan_ips: list[str]
-    pishgaman_ips: list[str]
+    service_label: str | None  # informational only -- see module docstring
+    farzanegan_ips: list[str] = field(default_factory=list)
+    pishgaman_ips: list[str] = field(default_factory=list)
+    row_numbers: list[int] = field(default_factory=list)
+
+    @property
+    def group_name(self) -> str | None:
+        return group_name_for_subdomain(self.subdomain)
+
+    @property
+    def row_range(self) -> str:
+        if not self.row_numbers:
+            return "?"
+        return (
+            str(self.row_numbers[0])
+            if len(self.row_numbers) == 1
+            else f"{self.row_numbers[0]}-{self.row_numbers[-1]}"
+        )
 
 
-def parse_csv(path: Path) -> list[CsvRow]:
-    rows = []
+def parse_csv(path: Path) -> list[CsvTarget]:
+    targets: dict[tuple[str, str, str], CsvTarget] = {}
+    order: list[tuple[str, str, str]] = []
+
     with path.open(newline="", encoding="utf-8-sig") as f:
-        reader = csv.DictReader(f)
-        for i, raw in enumerate(reader, start=2):  # header is row 1
-            rows.append(
-                CsvRow(
-                    row_number=i,
-                    domain=raw["domain"].strip(),
-                    subdomain=raw["subdomain"].strip(),
-                    record_type=raw["record_type"].strip().upper(),
-                    service=raw["service"].strip(),
-                    farzanegan_ips=[
-                        ip.strip() for ip in raw["farzanegan_ips"].split(",") if ip.strip()
-                    ],
-                    pishgaman_ips=[
-                        ip.strip() for ip in raw["pishgaman_ips"].split(",") if ip.strip()
-                    ],
+        reader = csv.reader(f)
+        next(reader, None)  # header
+
+        for row_number, raw_fields in enumerate(reader, start=2):
+            fields = [c.strip() for c in raw_fields]
+            if not any(fields):
+                continue  # blank line
+
+            domain, subdomain, record_type = fields[0], fields[1], fields[2].upper()
+            if subdomain.lower() in OUT_OF_SCOPE_SUBDOMAINS:
+                continue
+
+            rest = fields[3:]
+            if rest and _looks_like_ip(rest[0]):
+                service_label, ip_fields = None, rest
+            else:
+                service_label, ip_fields = (rest[0] if rest else None), rest[1:]
+
+            farzanegan_ip = ip_fields[0] if len(ip_fields) >= 1 and ip_fields[0] else None
+            pishgaman_ip = ip_fields[1] if len(ip_fields) >= 2 and ip_fields[1] else None
+
+            key = (domain, subdomain, record_type)
+            if key not in targets:
+                targets[key] = CsvTarget(
+                    domain=domain,
+                    subdomain=subdomain,
+                    record_type=record_type,
+                    service_label=service_label,
                 )
-            )
-    return rows
+                order.append(key)
+            csv_target = targets[key]
+            if farzanegan_ip:
+                csv_target.farzanegan_ips.append(farzanegan_ip)
+            if pishgaman_ip:
+                csv_target.pishgaman_ips.append(pishgaman_ip)
+            csv_target.row_numbers.append(row_number)
+
+    return [targets[k] for k in order]
 
 
 @dataclass
 class RowReport:
-    row: CsvRow
+    row: CsvTarget
     fqdn: str
     live_records: list[dict]
     farzanegan_datacenter_id: int
@@ -73,7 +157,7 @@ class RowReport:
 
 
 async def build_reconciliation_report(
-    session: AsyncSession, client: CloudflareClient, csv_rows: list[CsvRow]
+    session: AsyncSession, client: CloudflareClient, csv_targets: list[CsvTarget]
 ) -> list[RowReport]:
     dc_result = await session.execute(select(Datacenter))
     datacenters = {dc.name.lower(): dc for dc in dc_result.scalars().all()}
@@ -92,13 +176,13 @@ async def build_reconciliation_report(
     live_by_zone: dict[str, list[dict]] = {}
     reports: list[RowReport] = []
 
-    for row in csv_rows:
-        domain = domains_by_name.get(row.domain.lower())
+    for csv_target in csv_targets:
+        domain = domains_by_name.get(csv_target.domain.lower())
         if domain is None:
             reports.append(
                 RowReport(
-                    row=row,
-                    fqdn=f"{row.subdomain}.{row.domain}",
+                    row=csv_target,
+                    fqdn=f"{csv_target.subdomain}.{csv_target.domain}",
                     live_records=[],
                     farzanegan_datacenter_id=farzanegan.id,
                     pishgaman_datacenter_id=pishgaman.id,
@@ -117,14 +201,17 @@ async def build_reconciliation_report(
                 domain.cloudflare_zone_id
             )
 
-        fqdn = target_fqdn(row.subdomain, domain.name)
+        fqdn = target_fqdn(csv_target.subdomain, domain.name)
         live_records = [
             r
             for r in live_by_zone[domain.cloudflare_zone_id]
-            if r["name"].lower() == fqdn.lower() and r["type"] == row.record_type
+            if r["name"].lower() == fqdn.lower() and r["type"] == csv_target.record_type
         ]
 
-        candidates = {farzanegan.id: row.farzanegan_ips, pishgaman.id: row.pishgaman_ips}
+        candidates = {
+            farzanegan.id: csv_target.farzanegan_ips,
+            pishgaman.id: csv_target.pishgaman_ips,
+        }
         reconciliation = reconcile_against_live_records(candidates, live_records)
         farzanegan_matches = reconciliation[farzanegan.id]
         pishgaman_matches = reconciliation[pishgaman.id]
@@ -152,7 +239,7 @@ async def build_reconciliation_report(
 
         reports.append(
             RowReport(
-                row=row,
+                row=csv_target,
                 fqdn=fqdn,
                 live_records=live_records,
                 farzanegan_datacenter_id=farzanegan.id,
@@ -171,14 +258,14 @@ async def build_reconciliation_report(
 
 def format_report_table(reports: list[RowReport]) -> str:
     header = (
-        f"{'row':>4}  {'domain':<14}{'subdomain':<12}{'type':<6}{'service':<8}"
+        f"{'rows':>8}  {'domain':<14}{'subdomain':<10}{'type':<6}{'group':<8}"
         f"{'status':<16}{'resolved':<12}"
     )
     lines = [header, "-" * len(header)]
     for r in reports:
         lines.append(
-            f"{r.row.row_number:>4}  {r.row.domain:<14}{r.row.subdomain:<12}"
-            f"{r.row.record_type:<6}{r.row.service:<8}{r.status:<16}"
+            f"{r.row.row_range:>8}  {r.row.domain:<14}{r.row.subdomain:<10}"
+            f"{r.row.record_type:<6}{(r.row.group_name or '-'):<8}{r.status:<16}"
             f"{r.resolved_datacenter_name or '-':<12}"
         )
     counts: dict[str, int] = {}
@@ -194,12 +281,14 @@ def format_report_detail(reports: list[RowReport]) -> str:
     for r in reports:
         if r.status == "matched":
             continue
-        lines.append(f"\n=== row {r.row.row_number}: {r.fqdn} ({r.row.record_type}) [{r.status}] ===")
+        lines.append(
+            f"\n=== rows {r.row.row_range}: {r.fqdn} ({r.row.record_type}) [{r.status}] ==="
+        )
         lines.append(f"  farzanegan candidates: {r.row.farzanegan_ips}")
         for m in r.farzanegan_matches:
             found = f"LIVE record {m.cloudflare_record_id}" if m.cloudflare_record_id else "NOT FOUND"
             lines.append(f"    slot {m.slot_index}: {m.ip_address} -> {found}")
-        lines.append(f"  pishgaman candidates: {r.row.pishgaman_ips}")
+        lines.append(f"  pishgaman candidates: {r.row.pishgaman_ips or '(none configured)'}")
         for m in r.pishgaman_matches:
             found = f"LIVE record {m.cloudflare_record_id}" if m.cloudflare_record_id else "NOT FOUND"
             lines.append(f"    slot {m.slot_index}: {m.ip_address} -> {found}")
@@ -212,7 +301,7 @@ def format_report_detail(reports: list[RowReport]) -> str:
 
 @dataclass
 class ApplyResult:
-    applied_target_ids_by_service: dict[str, list[int]] = field(default_factory=dict)
+    applied_target_ids_by_group: dict[str, list[int]] = field(default_factory=dict)
     skipped_rows: list[RowReport] = field(default_factory=list)
 
 
@@ -279,20 +368,24 @@ async def apply_topology(session: AsyncSession, reports: list[RowReport]) -> App
                 ip_row.ip_address = m.ip_address
                 ip_row.cloudflare_record_id = m.cloudflare_record_id
 
-        result.applied_target_ids_by_service.setdefault(r.row.service, []).append(target.id)
+        if r.row.group_name:
+            result.applied_target_ids_by_group.setdefault(r.row.group_name, []).append(target.id)
 
     await session.flush()
     return result
 
 
 async def create_switch_groups(
-    session: AsyncSession, applied_target_ids_by_service: dict[str, list[int]], group_names: list[str]
+    session: AsyncSession, applied_target_ids_by_group: dict[str, list[int]]
 ) -> list[SwitchGroup]:
+    """Group names come entirely from applied_target_ids_by_group's keys
+    (derived from subdomain names during apply_topology) -- no hardcoded
+    list, so a new subdomain in a future CSV gets its own group with no
+    code change here."""
     created: list[SwitchGroup] = []
     all_target_ids: list[int] = []
 
-    for name in group_names:
-        target_ids = applied_target_ids_by_service.get(name, [])
+    for name, target_ids in applied_target_ids_by_group.items():
         if not target_ids:
             continue
         group = await _upsert_switch_group(session, name)
