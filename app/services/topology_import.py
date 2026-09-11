@@ -51,8 +51,11 @@ OUT_OF_SCOPE_SUBDOMAINS = {"admin"}
 
 # These subdomains all belong to one combined "Prime" switch group rather
 # than each getting their own -- the four georouted location variants plus
-# the main prime pointer itself.
-PRIME_GROUP_SUBDOMAINS = {"nl", "tr", "uk", "us", "prime"}
+# the main prime pointer itself. Both "us" and "usa" are listed: the two
+# domains spell the US location differently (alonet.co uses "us",
+# wanpire.net uses "usa" -- confirmed against live Cloudflare data), and
+# both must still land in the same Prime group.
+PRIME_GROUP_SUBDOMAINS = {"nl", "tr", "uk", "us", "usa", "prime"}
 PRIME_GROUP_NAME = "Prime"
 
 # Display-name overrides for well-known acronym subdomains; anything else

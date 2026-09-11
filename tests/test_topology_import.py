@@ -156,7 +156,9 @@ def test_parse_csv_different_services_under_same_subdomain_are_separate_targets(
 
 
 def test_group_name_prime_cluster():
-    for sub in ("nl", "tr", "uk", "us", "prime"):
+    # "us" and "usa" both included -- the two real domains spell the US
+    # location differently (alonet.co: "us", wanpire.net: "usa").
+    for sub in ("nl", "tr", "uk", "us", "usa", "prime"):
         assert group_name_for_subdomain(sub) == "Prime"
 
 
