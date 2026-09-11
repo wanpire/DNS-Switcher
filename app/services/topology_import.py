@@ -5,9 +5,8 @@ invoked automatically by this module) does the actual Domain/DnsTarget/
 TargetDatacenterIp/SwitchGroup writes for cleanly-matched rows only, after
 a human has reviewed the report.
 
-CSV shape: one row per (domain, subdomain, record_type) *candidate IP*, not
-one row per target -- a load-balanced target has several consecutive rows
-sharing the same (domain, subdomain, record_type), each contributing one
+CSV shape: one row per *candidate IP*, not one row per target -- a
+load-balanced target has several consecutive rows, each contributing one
 IP per datacenter column present. Row order within a group is slot order.
 Columns after (domain, subdomain, record_type) are positional and
 variable-length:
@@ -15,10 +14,18 @@ variable-length:
     domain,subdomain,record_type[,service][,<dc1_ip>[,<dc2_ip>]]
 
 `service` is present only when the field right after record_type is not a
-bare IPv4 address; when present it's an informational label only (e.g.
-"srv3") -- switch-group membership comes from the *subdomain*, not this
-column, so this format stays modular: a new subdomain automatically gets
-its own switch group with no code change. A row may have only one IP
+bare IPv4 address. Confirmed against live Cloudflare data: when present,
+`service` is the *actual DNS hostname* (e.g. subdomain "l2tp" + service
+"srv3" -> the real record is srv3.wanpire.net, not l2tp.wanpire.net) --
+`subdomain` in that case is a grouping/protocol label, not part of the
+DNS name at all. Rows are grouped into one target by (domain, DNS name,
+record_type) -- the DNS name being `service` when present, else
+`subdomain` directly. Switch-group membership is derived from `subdomain`
+regardless, so this format stays modular: a new subdomain automatically
+gets its own switch group with no code change, and two different
+`service` values under the same `subdomain` (e.g. srv3 and srv4, both
+"l2tp") correctly become two separate switchable targets in the same
+group, not one target with double the slots. A row may have only one IP
 column at all (e.g. a domain with no second datacenter configured yet).
 """
 
@@ -74,16 +81,16 @@ def group_name_for_subdomain(subdomain: str) -> str | None:
 @dataclass
 class CsvTarget:
     domain: str
-    subdomain: str
+    dns_name: str  # the actual subdomain used in DNS -- service label if present, else subdomain_label
+    subdomain_label: str  # the CSV's "subdomain" column; used only to derive group_name
     record_type: str
-    service_label: str | None  # informational only -- see module docstring
     farzanegan_ips: list[str] = field(default_factory=list)
     pishgaman_ips: list[str] = field(default_factory=list)
     row_numbers: list[int] = field(default_factory=list)
 
     @property
     def group_name(self) -> str | None:
-        return group_name_for_subdomain(self.subdomain)
+        return group_name_for_subdomain(self.subdomain_label)
 
     @property
     def row_range(self) -> str:
@@ -109,8 +116,8 @@ def parse_csv(path: Path) -> list[CsvTarget]:
             if not any(fields):
                 continue  # blank line
 
-            domain, subdomain, record_type = fields[0], fields[1], fields[2].upper()
-            if subdomain.lower() in OUT_OF_SCOPE_SUBDOMAINS:
+            domain, subdomain_label, record_type = fields[0], fields[1], fields[2].upper()
+            if subdomain_label.lower() in OUT_OF_SCOPE_SUBDOMAINS:
                 continue
 
             rest = fields[3:]
@@ -119,16 +126,18 @@ def parse_csv(path: Path) -> list[CsvTarget]:
             else:
                 service_label, ip_fields = (rest[0] if rest else None), rest[1:]
 
+            dns_name = service_label if service_label else subdomain_label
+
             farzanegan_ip = ip_fields[0] if len(ip_fields) >= 1 and ip_fields[0] else None
             pishgaman_ip = ip_fields[1] if len(ip_fields) >= 2 and ip_fields[1] else None
 
-            key = (domain, subdomain, record_type)
+            key = (domain, dns_name, record_type)
             if key not in targets:
                 targets[key] = CsvTarget(
                     domain=domain,
-                    subdomain=subdomain,
+                    dns_name=dns_name,
+                    subdomain_label=subdomain_label,
                     record_type=record_type,
-                    service_label=service_label,
                 )
                 order.append(key)
             csv_target = targets[key]
@@ -182,7 +191,7 @@ async def build_reconciliation_report(
             reports.append(
                 RowReport(
                     row=csv_target,
-                    fqdn=f"{csv_target.subdomain}.{csv_target.domain}",
+                    fqdn=f"{csv_target.dns_name}.{csv_target.domain}",
                     live_records=[],
                     farzanegan_datacenter_id=farzanegan.id,
                     pishgaman_datacenter_id=pishgaman.id,
@@ -201,7 +210,7 @@ async def build_reconciliation_report(
                 domain.cloudflare_zone_id
             )
 
-        fqdn = target_fqdn(csv_target.subdomain, domain.name)
+        fqdn = target_fqdn(csv_target.dns_name, domain.name)
         live_records = [
             r
             for r in live_by_zone[domain.cloudflare_zone_id]
@@ -258,13 +267,13 @@ async def build_reconciliation_report(
 
 def format_report_table(reports: list[RowReport]) -> str:
     header = (
-        f"{'rows':>8}  {'domain':<14}{'subdomain':<10}{'type':<6}{'group':<8}"
+        f"{'rows':>8}  {'domain':<14}{'dns_name':<10}{'type':<6}{'group':<8}"
         f"{'status':<16}{'resolved':<12}"
     )
     lines = [header, "-" * len(header)]
     for r in reports:
         lines.append(
-            f"{r.row.row_range:>8}  {r.row.domain:<14}{r.row.subdomain:<10}"
+            f"{r.row.row_range:>8}  {r.row.domain:<14}{r.row.dns_name:<10}"
             f"{r.row.record_type:<6}{(r.row.group_name or '-'):<8}{r.status:<16}"
             f"{r.resolved_datacenter_name or '-':<12}"
         )
@@ -324,7 +333,7 @@ async def apply_topology(session: AsyncSession, reports: list[RowReport]) -> App
         existing = await session.execute(
             select(DnsTarget).where(
                 DnsTarget.domain_id == domain.id,
-                DnsTarget.name == r.row.subdomain,
+                DnsTarget.name == r.row.dns_name,
                 DnsTarget.record_type == RecordType(r.row.record_type),
             )
         )
@@ -332,7 +341,7 @@ async def apply_topology(session: AsyncSession, reports: list[RowReport]) -> App
         if target is None:
             target = DnsTarget(
                 domain_id=domain.id,
-                name=r.row.subdomain,
+                name=r.row.dns_name,
                 record_type=RecordType(r.row.record_type),
                 proxied=False,
             )

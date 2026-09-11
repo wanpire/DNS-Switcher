@@ -36,6 +36,9 @@ async def _make_datacenter(session, name):
 
 
 def test_parse_csv_groups_multi_row_load_balanced_target(tmp_path):
+    """subdomain "sstp" + service "ss" -- the real DNS name is "ss"
+    (confirmed against live Cloudflare data), "sstp" is only a grouping
+    label."""
     csv_path = tmp_path / "topology.csv"
     csv_path.write_text(
         "domain,subdomain,record_type,service,farzanegan_ips,pishgaman_ips\n"
@@ -46,9 +49,10 @@ def test_parse_csv_groups_multi_row_load_balanced_target(tmp_path):
     assert len(targets) == 1
     t = targets[0]
     assert t.domain == "wanpire.net"
-    assert t.subdomain == "sstp"
+    assert t.dns_name == "ss"
+    assert t.subdomain_label == "sstp"
+    assert t.group_name == "SSTP"
     assert t.record_type == "A"
-    assert t.service_label == "ss"
     assert t.farzanegan_ips == ["95.142.238.2", "95.142.238.3"]
     assert t.pishgaman_ips == ["195.8.102.83", "195.8.102.84"]
     assert t.row_numbers == [2, 3]
@@ -63,7 +67,8 @@ def test_parse_csv_handles_row_with_no_service_column(tmp_path):
     targets = parse_csv(csv_path)
     assert len(targets) == 1
     t = targets[0]
-    assert t.service_label is None
+    assert t.dns_name == "nl"
+    assert t.subdomain_label == "nl"
     assert t.farzanegan_ips == ["95.142.238.7"]
     assert t.pishgaman_ips == ["91.213.151.64"]
 
@@ -91,7 +96,8 @@ def test_parse_csv_handles_single_ip_with_service(tmp_path):
     targets = parse_csv(csv_path)
     assert len(targets) == 1
     t = targets[0]
-    assert t.service_label == "l2"
+    assert t.dns_name == "l2"
+    assert t.subdomain_label == "l2tp"
     assert t.farzanegan_ips == ["95.142.238.69", "95.142.238.70"]
     assert t.pishgaman_ips == []
 
@@ -104,7 +110,7 @@ def test_parse_csv_skips_out_of_scope_subdomain(tmp_path):
         "wanpire.net,www,A,,1.1.1.1,2.2.2.2\n"
     )
     targets = parse_csv(csv_path)
-    assert [t.subdomain for t in targets] == ["www"]
+    assert [t.dns_name for t in targets] == ["www"]
 
 
 def test_parse_csv_skips_blank_lines(tmp_path):
@@ -119,11 +125,13 @@ def test_parse_csv_skips_blank_lines(tmp_path):
     assert len(targets) == 2
 
 
-def test_parse_csv_duplicate_ips_across_service_labels_become_one_target_many_slots(tmp_path):
-    """The real l2tp case: two service-label blocks (srv3, srv4) sharing
-    the same subdomain and even the same IP values -- intentional DNS-level
-    load balancing (confirmed by the user), not a parsing error. All rows
-    must merge into one target with 8 ordered slots."""
+def test_parse_csv_different_services_under_same_subdomain_are_separate_targets(tmp_path):
+    """The real l2tp case: two service labels (srv3, srv4) share the same
+    subdomain grouping label AND even the same IP pool (both L2TP boxes
+    happen to share infrastructure) -- confirmed against live Cloudflare
+    data that srv3.wanpire.net and srv4.wanpire.net are two genuinely
+    separate, independently switchable records, NOT one target with
+    double the slots. They must stay separate but share a group_name."""
     csv_path = tmp_path / "topology.csv"
     lines = ["domain,subdomain,record_type,service,farzanegan_ips,pishgaman_ips"]
     for label in ("srv3", "srv4"):
@@ -135,10 +143,13 @@ def test_parse_csv_duplicate_ips_across_service_labels_become_one_target_many_sl
     csv_path.write_text("\n".join(lines) + "\n")
 
     targets = parse_csv(csv_path)
-    assert len(targets) == 1
-    t = targets[0]
-    assert len(t.farzanegan_ips) == 4
-    assert t.farzanegan_ips == ["95.142.238.2", "95.142.238.3", "95.142.238.2", "95.142.238.3"]
+    assert len(targets) == 2
+    by_name = {t.dns_name: t for t in targets}
+    assert set(by_name) == {"srv3", "srv4"}
+    for t in targets:
+        assert t.group_name == "L2TP"
+        assert t.farzanegan_ips == ["95.142.238.2", "95.142.238.3"]
+        assert t.pishgaman_ips == ["195.8.102.83", "195.8.102.84"]
 
 
 # --- group_name_for_subdomain -----------------------------------------------
@@ -291,7 +302,7 @@ async def test_apply_topology_writes_matched_targets_and_skips_others(session, t
         result = await apply_topology(session, reports)
 
     assert len(result.skipped_rows) == 1
-    assert result.skipped_rows[0].row.subdomain == "missing"
+    assert result.skipped_rows[0].row.dns_name == "missing"
     assert "Www" in result.applied_target_ids_by_group
 
 
