@@ -277,3 +277,116 @@ async def test_audit_log_pagination_and_filtering(session, api_client):
         "/audit-log", params={"dns_target_id": 999999}, headers=headers
     )
     assert empty_resp.json()["total"] == 0
+
+
+async def test_plan_and_execute_single_switch_unavailable_destination(session, api_client):
+    # A target with no IPs configured for the destination datacenter must
+    # come back as a normal 200 with unavailable=True -- never a raw error.
+    domain = await _make_domain(session)
+    dc1 = await _make_datacenter(session, "dc1")
+    dc2 = await _make_datacenter(session, "dc2")
+    target = await _make_target(session, domain)
+    await _add_ip(session, target, dc1, "1.1.1.1", "cf-1")
+    target.current_datacenter_id = dc1.id
+    await session.flush()
+
+    headers = {"X-Internal-Secret": SECRET}
+
+    plan_resp = await api_client.post(
+        "/switch/single/plan",
+        json={"dns_target_id": target.id, "target_datacenter_id": dc2.id},
+        headers=headers,
+    )
+    assert plan_resp.status_code == 200
+    body = plan_resp.json()
+    assert body["unavailable"] is True
+    assert body["unavailable_reason"]
+    assert body["slot_diffs"] == []
+
+    exec_resp = await api_client.post(
+        "/switch/single/execute",
+        json={"dns_target_id": target.id, "target_datacenter_id": dc2.id, "actor": "alice"},
+        headers=headers,
+    )
+    assert exec_resp.status_code == 200
+    exec_body = exec_resp.json()
+    assert exec_body["success"] is False
+    assert exec_body["unavailable"] is True
+    assert exec_body["audit_log_entry_id"] is None
+
+    await session.refresh(target)
+    assert target.current_datacenter_id == dc1.id  # untouched
+
+
+@respx.mock
+async def test_bulk_switch_via_api_with_domain_scoping_and_skipped_count(session, api_client):
+    domain_a = await _make_domain(session, name="a.example.com", zone="zone-a")
+    domain_b = await _make_domain(session, name="b.example.com", zone="zone-b")
+    dc1 = await _make_datacenter(session, "dc1")
+    dc2 = await _make_datacenter(session, "dc2")
+
+    ready = await _make_target(session, domain_a, name="ready")
+    await _add_ip(session, ready, dc1, "1.1.1.1", "cf-ready")
+    await _add_ip(session, ready, dc2, "2.2.2.1")
+    ready.current_datacenter_id = dc1.id
+
+    not_deployed = await _make_target(session, domain_a, name="not-deployed")
+    await _add_ip(session, not_deployed, dc1, "1.1.1.2", "cf-nd")
+    not_deployed.current_datacenter_id = dc1.id
+
+    other_domain = await _make_target(session, domain_b, name="other")
+    await _add_ip(session, other_domain, dc1, "1.1.1.3", "cf-other")
+    await _add_ip(session, other_domain, dc2, "2.2.2.3")
+    other_domain.current_datacenter_id = dc1.id
+    await session.flush()
+
+    group = SwitchGroup(name="group1")
+    session.add(group)
+    await session.flush()
+    session.add_all(
+        [
+            SwitchGroupMember(switch_group_id=group.id, dns_target_id=ready.id, position=0),
+            SwitchGroupMember(switch_group_id=group.id, dns_target_id=not_deployed.id, position=1),
+            SwitchGroupMember(switch_group_id=group.id, dns_target_id=other_domain.id, position=2),
+        ]
+    )
+    await session.flush()
+
+    headers = {"X-Internal-Secret": SECRET}
+
+    plan_resp = await api_client.post(
+        "/switch/bulk/plan",
+        json={"switch_group_id": group.id, "target_datacenter_id": dc2.id, "domain_id": domain_a.id},
+        headers=headers,
+    )
+    assert plan_resp.status_code == 200
+    plan_ids = [p["dns_target_id"] for p in plan_resp.json()]
+    assert set(plan_ids) == {ready.id, not_deployed.id}  # other_domain filtered out
+
+    respx.get(f"{BASE}/zones/zone-a/dns_records/cf-ready").mock(
+        return_value=_cf_ok({"id": "cf-ready", "content": "1.1.1.1"})
+    )
+    respx.patch(f"{BASE}/zones/zone-a/dns_records/cf-ready").mock(
+        return_value=_cf_ok({"id": "cf-ready", "content": "2.2.2.1"})
+    )
+
+    exec_resp = await api_client.post(
+        "/switch/bulk/execute",
+        json={
+            "switch_group_id": group.id,
+            "target_datacenter_id": dc2.id,
+            "actor": "alice",
+            "domain_id": domain_a.id,
+        },
+        headers=headers,
+    )
+    assert exec_resp.status_code == 200
+    body = exec_resp.json()
+    assert body["succeeded_count"] == 1
+    assert body["failed_count"] == 0
+    assert body["skipped_count"] == 1
+    result_ids = {r["dns_target_id"] for r in body["results"]}
+    assert result_ids == {ready.id, not_deployed.id}
+
+    await session.refresh(other_domain)
+    assert other_domain.current_datacenter_id == dc1.id  # untouched -- filtered out by domain_id

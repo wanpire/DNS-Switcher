@@ -102,7 +102,9 @@ def test_parse_csv_handles_single_ip_with_service(tmp_path):
     assert t.pishgaman_ips == []
 
 
-def test_parse_csv_skips_out_of_scope_subdomain(tmp_path):
+def test_parse_csv_no_longer_skips_admin_subdomain(tmp_path):
+    # admin used to be out of scope; it's now an imported, switchable
+    # target (wanpire.net's Prime group) -- see group_name_for_subdomain.
     csv_path = tmp_path / "topology.csv"
     csv_path.write_text(
         "domain,subdomain,record_type,service,farzanegan_ips,pishgaman_ips\n"
@@ -110,7 +112,7 @@ def test_parse_csv_skips_out_of_scope_subdomain(tmp_path):
         "wanpire.net,www,A,,1.1.1.1,2.2.2.2\n"
     )
     targets = parse_csv(csv_path)
-    assert [t.dns_name for t in targets] == ["www"]
+    assert {t.dns_name for t in targets} == {"admin", "www"}
 
 
 def test_parse_csv_skips_blank_lines(tmp_path):
@@ -155,26 +157,36 @@ def test_parse_csv_different_services_under_same_subdomain_are_separate_targets(
 # --- group_name_for_subdomain -----------------------------------------------
 
 
-def test_group_name_prime_cluster():
-    # "us" and "usa" both included -- the two real domains spell the US
-    # location differently (alonet.co: "us", wanpire.net: "usa").
-    for sub in ("nl", "tr", "uk", "us", "usa", "prime"):
-        assert group_name_for_subdomain(sub) == "Prime"
+def test_group_name_alonet_prime_cluster_has_no_split():
+    # alonet.co's whole georouted cluster -- prime + all 4 location
+    # variants -- lands in one "Prime" group, never a separate
+    # "Fix Location" group.
+    for sub in ("prime", "nl", "tr", "uk", "us"):
+        assert group_name_for_subdomain(sub, "alonet.co") == "Prime"
+
+
+def test_group_name_wanpire_splits_prime_and_fix_location():
+    # wanpire.net's own cluster splits: prime + admin -> "Prime",
+    # the 4 location variants (spelled "usa", not "us") -> "Fix Location".
+    assert group_name_for_subdomain("prime", "wanpire.net") == "Prime"
+    assert group_name_for_subdomain("admin", "wanpire.net") == "Prime"
+    for sub in ("nl", "tr", "uk", "usa"):
+        assert group_name_for_subdomain(sub, "wanpire.net") == "Fix Location"
 
 
 def test_group_name_known_acronyms():
-    assert group_name_for_subdomain("l2tp") == "L2TP"
-    assert group_name_for_subdomain("sstp") == "SSTP"
+    assert group_name_for_subdomain("l2tp", "wanpire.net") == "L2TP"
+    assert group_name_for_subdomain("sstp", "alonet.co") == "SSTP"
 
 
-def test_group_name_out_of_scope():
-    assert group_name_for_subdomain("admin") is None
+def test_group_name_admin_no_longer_out_of_scope():
+    assert group_name_for_subdomain("admin", "wanpire.net") == "Prime"
 
 
 def test_group_name_falls_back_to_capitalized_subdomain():
-    assert group_name_for_subdomain("open") == "Open"
-    assert group_name_for_subdomain("cisco") == "Cisco"
-    assert group_name_for_subdomain("newservice") == "Newservice"
+    assert group_name_for_subdomain("open", "wanpire.net") == "Open"
+    assert group_name_for_subdomain("cisco", "alonet.co") == "Cisco"
+    assert group_name_for_subdomain("newservice", "wanpire.net") == "Newservice"
 
 
 # --- build_reconciliation_report -------------------------------------------

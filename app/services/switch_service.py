@@ -65,6 +65,13 @@ class SwitchPlan:
     slot_diffs: list[SlotDiff]
     slot_count_mismatch: bool
     no_op: bool
+    # True when the destination datacenter has no IPs configured for this
+    # target at all -- a real, expected state (e.g. a datacenter not yet
+    # deployed for a given service), not an error. plan_* never raises for
+    # this; execute_* short-circuits without touching Cloudflare or writing
+    # an audit entry, since nothing was actually attempted.
+    unavailable: bool = False
+    unavailable_reason: str | None = None
 
 
 @dataclass
@@ -75,6 +82,7 @@ class SwitchExecutionResult:
     audit_log_entry: AuditLogEntry | None
     slot_results: list[dict] = field(default_factory=list)
     error_message: str | None = None
+    unavailable: bool = False
 
 
 @dataclass
@@ -88,8 +96,12 @@ class BulkSwitchExecutionSummary:
         return [r for r in self.results if r.success]
 
     @property
+    def skipped(self) -> list[SwitchExecutionResult]:
+        return [r for r in self.results if r.unavailable]
+
+    @property
     def failed(self) -> list[SwitchExecutionResult]:
-        return [r for r in self.results if not r.success]
+        return [r for r in self.results if not r.success and not r.unavailable]
 
 
 class SwitchService:
@@ -124,9 +136,23 @@ class SwitchService:
 
         dest_slots = await self._get_slots(dns_target_id, target_datacenter_id)
         if not dest_slots:
-            raise SwitchValidationError(
-                f"No IPs configured for DnsTarget {dns_target_id} at datacenter "
-                f"'{target_dc.name}'"
+            # A real, expected state (e.g. a datacenter not yet deployed for
+            # this service) -- never an exception. Callers (bulk execute, the
+            # API, the bot) all need to represent this as data, not a 400.
+            return SwitchPlan(
+                dns_target_id=target.id,
+                fqdn=fqdn,
+                record_type=target.record_type.value,
+                proxied=target.proxied,
+                current_datacenter_id=target.current_datacenter_id,
+                target_datacenter_id=target_dc.id,
+                slot_diffs=[],
+                slot_count_mismatch=False,
+                no_op=False,
+                unavailable=True,
+                unavailable_reason=(
+                    f"دیتاسنتر {target_dc.name} برای این سرویس هنوز راه‌اندازی نشده"
+                ),
             )
 
         source_slots: list[TargetDatacenterIp] = []
@@ -161,9 +187,9 @@ class SwitchService:
             ),
         )
 
-    async def plan_bulk_switch(
-        self, switch_group_id: int, target_datacenter_id: int
-    ) -> list[SwitchPlan]:
+    async def _group_member_target_ids(
+        self, switch_group_id: int, *, domain_id: int | None = None
+    ) -> list[int]:
         result = await self._session.execute(
             select(SwitchGroup)
             .where(SwitchGroup.id == switch_group_id)
@@ -173,9 +199,25 @@ class SwitchService:
         if group is None:
             raise SwitchValidationError(f"SwitchGroup {switch_group_id} not found")
 
+        member_ids = [m.dns_target_id for m in group.members]
+        if domain_id is None:
+            return member_ids
+
+        in_domain = await self._session.execute(
+            select(DnsTarget.id).where(
+                DnsTarget.id.in_(member_ids), DnsTarget.domain_id == domain_id
+            )
+        )
+        in_domain_ids = {row[0] for row in in_domain.all()}
+        return [tid for tid in member_ids if tid in in_domain_ids]
+
+    async def plan_bulk_switch(
+        self, switch_group_id: int, target_datacenter_id: int, *, domain_id: int | None = None
+    ) -> list[SwitchPlan]:
+        member_ids = await self._group_member_target_ids(switch_group_id, domain_id=domain_id)
         return [
-            await self.plan_single_switch(member.dns_target_id, target_datacenter_id)
-            for member in group.members
+            await self.plan_single_switch(target_id, target_datacenter_id)
+            for target_id in member_ids
         ]
 
     async def _update_slot_bookkeeping(
@@ -217,6 +259,19 @@ class SwitchService:
     ) -> SwitchExecutionResult:
         # Re-derive the plan internally -- never trust a caller-supplied diff.
         plan = await self.plan_single_switch(dns_target_id, target_datacenter_id)
+
+        if plan.unavailable:
+            # Nothing to attempt -- no Cloudflare call, no audit entry (there
+            # was no real action taken, same reasoning as a validation
+            # failure on a bad ID, just never raised for this specific case).
+            return SwitchExecutionResult(
+                dns_target_id=dns_target_id,
+                success=False,
+                skipped=False,
+                audit_log_entry=None,
+                error_message=plan.unavailable_reason,
+                unavailable=True,
+            )
 
         if plan.slot_count_mismatch and not allow_slot_count_mismatch:
             source_count = sum(1 for d in plan.slot_diffs if d.current_ip is not None)
@@ -322,34 +377,41 @@ class SwitchService:
         )
 
     async def execute_bulk_switch(
-        self, switch_group_id: int, target_datacenter_id: int, actor: str
+        self,
+        switch_group_id: int,
+        target_datacenter_id: int,
+        actor: str,
+        *,
+        domain_id: int | None = None,
     ) -> BulkSwitchExecutionSummary:
-        plans = await self.plan_bulk_switch(switch_group_id, target_datacenter_id)
+        member_ids = await self._group_member_target_ids(switch_group_id, domain_id=domain_id)
         delay = get_settings().bulk_switch_delay_seconds
 
         summary = BulkSwitchExecutionSummary(
             switch_group_id=switch_group_id, target_datacenter_id=target_datacenter_id
         )
 
-        for i, plan in enumerate(plans):
+        for i, target_id in enumerate(member_ids):
             try:
                 # Slot-count mismatches are never silently allowed in bulk --
                 # a member that would create/delete records fails cleanly
                 # here and must be handled individually with explicit
                 # confirmation, same reasoning as the single-switch default.
+                # A target with no IPs configured for the destination
+                # datacenter (execute_single_switch's unavailable=True
+                # result) is NOT a failure here either -- it's tallied under
+                # summary.skipped, not summary.failed.
                 result = await self.execute_single_switch(
-                    plan.dns_target_id,
+                    target_id,
                     target_datacenter_id,
                     actor,
                     action_type=ActionType.bulk,
                     switch_group_id=switch_group_id,
                 )
             except SwitchValidationError as exc:
-                logger.warning(
-                    "bulk switch: target %s could not be executed: %s", plan.dns_target_id, exc
-                )
+                logger.warning("bulk switch: target %s could not be executed: %s", target_id, exc)
                 result = SwitchExecutionResult(
-                    dns_target_id=plan.dns_target_id,
+                    dns_target_id=target_id,
                     success=False,
                     skipped=False,
                     audit_log_entry=None,
@@ -357,7 +419,7 @@ class SwitchService:
                 )
             summary.results.append(result)
 
-            if i < len(plans) - 1:
+            if i < len(member_ids) - 1:
                 await asyncio.sleep(delay)
 
         return summary

@@ -100,7 +100,10 @@ async def test_plan_single_switch_no_op_when_already_on_target(session):
     assert plan.no_op is True
 
 
-async def test_plan_single_switch_raises_when_destination_has_no_ips(session):
+async def test_plan_single_switch_marks_unavailable_when_destination_has_no_ips(session):
+    # Not a bug: e.g. alonet.co is only deployed on one datacenter so far.
+    # plan_single_switch must never raise for this -- it returns a plan
+    # flagged unavailable=True with a friendly reason instead.
     domain = await _make_domain(session)
     dc1 = await _make_datacenter(session, "dc1")
     dc2 = await _make_datacenter(session, "dc2")
@@ -108,9 +111,15 @@ async def test_plan_single_switch_raises_when_destination_has_no_ips(session):
     await _add_ips(session, target, dc1, [("1.1.1.1", "cf-1")])
 
     client = CloudflareClient(api_token="test-token")
-    with pytest.raises(SwitchValidationError, match="No IPs configured"):
-        await SwitchService(session, client).plan_single_switch(target.id, dc2.id)
+    plan = await SwitchService(session, client).plan_single_switch(target.id, dc2.id)
     await client.aclose()
+
+    assert plan.unavailable is True
+    assert plan.unavailable_reason is not None
+    assert dc2.name in plan.unavailable_reason
+    assert plan.slot_diffs == []
+    assert plan.no_op is False
+    assert plan.slot_count_mismatch is False
 
 
 async def test_plan_single_switch_detects_slot_count_mismatch(session):
@@ -541,3 +550,156 @@ async def test_bulk_switch_member_with_slot_mismatch_fails_cleanly(session, monk
     assert "allow_slot_count_mismatch" in summary.failed[0].error_message
     assert len(summary.succeeded) == 1
     assert summary.succeeded[0].dns_target_id == clean.id
+
+
+# --- bulk switch: unavailable targets are skipped, not failed ---------------
+
+
+@respx.mock
+async def test_execute_bulk_switch_skips_unavailable_targets(session, monkeypatch):
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(
+        "app.services.switch_service.get_settings",
+        lambda: SimpleNamespace(bulk_switch_delay_seconds=0),
+    )
+
+    domain = await _make_domain(session)
+    dc1 = await _make_datacenter(session, "dc1")
+    dc2 = await _make_datacenter(session, "dc2")
+
+    ready = await _make_target(session, domain, name="ready")
+    await _add_ips(session, ready, dc1, [("1.1.1.1", "cf-ready")])
+    await _add_ips(session, ready, dc2, [("2.2.2.1", None)])
+    ready.current_datacenter_id = dc1.id
+
+    not_deployed = await _make_target(session, domain, name="not-deployed")
+    await _add_ips(session, not_deployed, dc1, [("1.1.1.2", "cf-nd")])
+    # no dc2 IPs configured at all -- dc2 not deployed for this target
+    not_deployed.current_datacenter_id = dc1.id
+    await session.flush()
+
+    group = SwitchGroup(name="group1")
+    session.add(group)
+    await session.flush()
+    session.add_all(
+        [
+            SwitchGroupMember(switch_group_id=group.id, dns_target_id=ready.id, position=0),
+            SwitchGroupMember(switch_group_id=group.id, dns_target_id=not_deployed.id, position=1),
+        ]
+    )
+    await session.flush()
+
+    respx.get(f"{BASE}/zones/zone-1/dns_records/cf-ready").mock(
+        return_value=_cf_ok({"id": "cf-ready", "content": "1.1.1.1"})
+    )
+    respx.patch(f"{BASE}/zones/zone-1/dns_records/cf-ready").mock(
+        return_value=_cf_ok({"id": "cf-ready", "content": "2.2.2.1"})
+    )
+
+    client = CloudflareClient(api_token="test-token")
+    summary = await SwitchService(session, client).execute_bulk_switch(group.id, dc2.id, actor="tester")
+    await client.aclose()
+
+    assert len(summary.succeeded) == 1
+    assert summary.succeeded[0].dns_target_id == ready.id
+    assert len(summary.failed) == 0
+    assert len(summary.skipped) == 1
+    assert summary.skipped[0].dns_target_id == not_deployed.id
+    assert summary.skipped[0].unavailable is True
+    # skipped target must never actually move
+    assert not_deployed.current_datacenter_id == dc1.id
+
+
+# --- bulk switch: domain_id scoping ------------------------------------------
+
+
+async def test_plan_bulk_switch_filters_by_domain_id(session):
+    domain_a = await _make_domain(session, name="a.example.com", zone="zone-a")
+    domain_b = await _make_domain(session, name="b.example.com", zone="zone-b")
+    dc1 = await _make_datacenter(session, "dc1")
+    dc2 = await _make_datacenter(session, "dc2")
+
+    target_a = await _make_target(session, domain_a, name="www")
+    await _add_ips(session, target_a, dc1, [("1.1.1.1", "cf-a")])
+    await _add_ips(session, target_a, dc2, [("2.2.2.1", None)])
+    target_a.current_datacenter_id = dc1.id
+
+    target_b = await _make_target(session, domain_b, name="www")
+    await _add_ips(session, target_b, dc1, [("1.1.1.2", "cf-b")])
+    await _add_ips(session, target_b, dc2, [("2.2.2.2", None)])
+    target_b.current_datacenter_id = dc1.id
+    await session.flush()
+
+    group = SwitchGroup(name="group1")
+    session.add(group)
+    await session.flush()
+    session.add_all(
+        [
+            SwitchGroupMember(switch_group_id=group.id, dns_target_id=target_a.id, position=0),
+            SwitchGroupMember(switch_group_id=group.id, dns_target_id=target_b.id, position=1),
+        ]
+    )
+    await session.flush()
+
+    client = CloudflareClient(api_token="test-token")
+    plans = await SwitchService(session, client).plan_bulk_switch(
+        group.id, dc2.id, domain_id=domain_a.id
+    )
+    await client.aclose()
+
+    assert [p.dns_target_id for p in plans] == [target_a.id]
+
+
+@respx.mock
+async def test_execute_bulk_switch_filters_by_domain_id(session, monkeypatch):
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(
+        "app.services.switch_service.get_settings",
+        lambda: SimpleNamespace(bulk_switch_delay_seconds=0),
+    )
+
+    domain_a = await _make_domain(session, name="a.example.com", zone="zone-a")
+    domain_b = await _make_domain(session, name="b.example.com", zone="zone-b")
+    dc1 = await _make_datacenter(session, "dc1")
+    dc2 = await _make_datacenter(session, "dc2")
+
+    target_a = await _make_target(session, domain_a, name="www")
+    await _add_ips(session, target_a, dc1, [("1.1.1.1", "cf-a")])
+    await _add_ips(session, target_a, dc2, [("2.2.2.1", None)])
+    target_a.current_datacenter_id = dc1.id
+
+    target_b = await _make_target(session, domain_b, name="www")
+    await _add_ips(session, target_b, dc1, [("1.1.1.2", "cf-b")])
+    await _add_ips(session, target_b, dc2, [("2.2.2.2", None)])
+    target_b.current_datacenter_id = dc1.id
+    await session.flush()
+
+    group = SwitchGroup(name="group1")
+    session.add(group)
+    await session.flush()
+    session.add_all(
+        [
+            SwitchGroupMember(switch_group_id=group.id, dns_target_id=target_a.id, position=0),
+            SwitchGroupMember(switch_group_id=group.id, dns_target_id=target_b.id, position=1),
+        ]
+    )
+    await session.flush()
+
+    respx.get(f"{BASE}/zones/zone-a/dns_records/cf-a").mock(
+        return_value=_cf_ok({"id": "cf-a", "content": "1.1.1.1"})
+    )
+    respx.patch(f"{BASE}/zones/zone-a/dns_records/cf-a").mock(
+        return_value=_cf_ok({"id": "cf-a", "content": "2.2.2.1"})
+    )
+
+    client = CloudflareClient(api_token="test-token")
+    summary = await SwitchService(session, client).execute_bulk_switch(
+        group.id, dc2.id, actor="tester", domain_id=domain_a.id
+    )
+    await client.aclose()
+
+    assert [r.dns_target_id for r in summary.results] == [target_a.id]
+    assert target_a.current_datacenter_id == dc2.id
+    assert target_b.current_datacenter_id == dc1.id  # untouched -- filtered out by domain_id

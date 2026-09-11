@@ -59,6 +59,8 @@ class SwitchPlanOut(BaseModel):
     slot_diffs: list[SlotDiffOut]
     slot_count_mismatch: bool
     no_op: bool
+    unavailable: bool
+    unavailable_reason: str | None
 
 
 class SingleSwitchPlanRequest(BaseModel):
@@ -76,12 +78,14 @@ class SingleSwitchExecuteRequest(BaseModel):
 class BulkSwitchPlanRequest(BaseModel):
     switch_group_id: int
     target_datacenter_id: int
+    domain_id: int | None = None
 
 
 class BulkSwitchExecuteRequest(BaseModel):
     switch_group_id: int
     target_datacenter_id: int
     actor: str
+    domain_id: int | None = None
 
 
 class RollbackRequest(BaseModel):
@@ -104,6 +108,7 @@ class SwitchExecutionOut(BaseModel):
     error_message: str | None
     audit_log_entry_id: int | None
     slot_results: list[SlotResultOut]
+    unavailable: bool
 
 
 class BulkSwitchExecutionOut(BaseModel):
@@ -111,6 +116,7 @@ class BulkSwitchExecutionOut(BaseModel):
     target_datacenter_id: int
     succeeded_count: int
     failed_count: int
+    skipped_count: int
     results: list[SwitchExecutionOut]
 
 

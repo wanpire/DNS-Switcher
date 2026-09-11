@@ -35,6 +35,7 @@ def _to_execution_out(result) -> SwitchExecutionOut:
         error_message=result.error_message,
         audit_log_entry_id=result.audit_log_entry.id if result.audit_log_entry else None,
         slot_results=result.slot_results,
+        unavailable=result.unavailable,
     )
 
 
@@ -120,7 +121,9 @@ async def plan_bulk_switch(
 ):
     service = SwitchService(session, cf)
     try:
-        plans = await service.plan_bulk_switch(body.switch_group_id, body.target_datacenter_id)
+        plans = await service.plan_bulk_switch(
+            body.switch_group_id, body.target_datacenter_id, domain_id=body.domain_id
+        )
     except SwitchValidationError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     return [SwitchPlanOut.model_validate(p) for p in plans]
@@ -135,7 +138,7 @@ async def execute_bulk_switch(
     service = SwitchService(session, cf)
     try:
         summary = await service.execute_bulk_switch(
-            body.switch_group_id, body.target_datacenter_id, body.actor
+            body.switch_group_id, body.target_datacenter_id, body.actor, domain_id=body.domain_id
         )
     except SwitchValidationError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
@@ -144,6 +147,7 @@ async def execute_bulk_switch(
         target_datacenter_id=summary.target_datacenter_id,
         succeeded_count=len(summary.succeeded),
         failed_count=len(summary.failed),
+        skipped_count=len(summary.skipped),
         results=[_to_execution_out(r) for r in summary.results],
     )
 

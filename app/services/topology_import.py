@@ -46,17 +46,24 @@ EMERGENCY_GROUP_NAME = "همه‌چیز (اورژانس کامل)"
 EMERGENCY_GROUP_DESCRIPTION = "Full emergency failover -- every managed target across all groups"
 
 # Subdomains excluded entirely -- constant-value records the operator does
-# not want touched by this tool at all.
-OUT_OF_SCOPE_SUBDOMAINS = {"admin"}
+# not want touched by this tool at all. Empty for now: "admin" used to be
+# here, but wanpire.net's admin subdomain is now an imported, switchable
+# target (part of its Prime group) -- see group_name_for_subdomain below.
+OUT_OF_SCOPE_SUBDOMAINS: set[str] = set()
 
-# These subdomains all belong to one combined "Prime" switch group rather
-# than each getting their own -- the four georouted location variants plus
-# the main prime pointer itself. Both "us" and "usa" are listed: the two
-# domains spell the US location differently (alonet.co uses "us",
-# wanpire.net uses "usa" -- confirmed against live Cloudflare data), and
-# both must still land in the same Prime group.
-PRIME_GROUP_SUBDOMAINS = {"nl", "tr", "uk", "us", "usa", "prime"}
+# Prime-group membership differs by domain and is NOT a simple union:
+# alonet.co's entire georouted cluster (prime + all 4 location variants)
+# lives in one cross-domain "Prime" group with no further split, while
+# wanpire.net splits its own cluster into "Prime" (prime + admin) and a
+# separate "Fix Location" group (the 4 location variants) -- confirmed
+# explicitly with the operator. wanpire.net spells the US location "usa",
+# alonet.co spells it "us" (confirmed against live Cloudflare data).
+ALONET_DOMAIN = "alonet.co"
+ALONET_PRIME_SUBDOMAINS = {"prime", "nl", "tr", "uk", "us"}
+WANPIRE_PRIME_SUBDOMAINS = {"prime", "admin"}
+WANPIRE_FIX_LOCATION_SUBDOMAINS = {"nl", "tr", "uk", "us", "usa"}
 PRIME_GROUP_NAME = "Prime"
+FIX_LOCATION_GROUP_NAME = "Fix Location"
 
 # Display-name overrides for well-known acronym subdomains; anything else
 # not listed here just gets its subdomain capitalized as its group name --
@@ -70,14 +77,23 @@ def _looks_like_ip(value: str) -> bool:
     return bool(_IPV4_RE.match(value))
 
 
-def group_name_for_subdomain(subdomain: str) -> str | None:
+def group_name_for_subdomain(subdomain: str, domain: str) -> str | None:
     """None means "not part of any switch group" -- still imported as a
-    DnsTarget (unless also out of scope), just not bulk-switchable."""
+    DnsTarget (unless also out of scope), just not bulk-switchable.
+
+    Domain-aware because Prime-cluster grouping differs by domain: see the
+    module-level comment above ALONET_PRIME_SUBDOMAINS."""
     key = subdomain.lower()
     if key in OUT_OF_SCOPE_SUBDOMAINS:
         return None
-    if key in PRIME_GROUP_SUBDOMAINS:
+    if domain.lower() == ALONET_DOMAIN:
+        if key in ALONET_PRIME_SUBDOMAINS:
+            return PRIME_GROUP_NAME
+        return GROUP_DISPLAY_NAMES.get(key, subdomain.capitalize())
+    if key in WANPIRE_PRIME_SUBDOMAINS:
         return PRIME_GROUP_NAME
+    if key in WANPIRE_FIX_LOCATION_SUBDOMAINS:
+        return FIX_LOCATION_GROUP_NAME
     return GROUP_DISPLAY_NAMES.get(key, subdomain.capitalize())
 
 
@@ -93,7 +109,7 @@ class CsvTarget:
 
     @property
     def group_name(self) -> str | None:
-        return group_name_for_subdomain(self.subdomain_label)
+        return group_name_for_subdomain(self.subdomain_label, self.domain)
 
     @property
     def row_range(self) -> str:
