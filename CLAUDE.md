@@ -102,7 +102,11 @@ Environment variables (see `.env.example`):
   `postgresql+asyncpg://user:pass@db:5432/dns_switcher`.
 - `INTERNAL_API_SHARED_SECRET` — shared secret checked against a header on
   every request from the AloBot container. This API has no other auth layer
-  and must never be exposed outside the internal Docker network.
+  and must never be exposed outside the internal Docker network —
+  `docker-compose.yml` enforces this by not publishing a host port for the
+  `dns-switcher` service at all; reach it only from other containers on
+  `dns-switcher-net`, or via `docker compose exec` for local debugging (see
+  `RUNBOOK.md`).
 
 ## Project layout
 
@@ -223,3 +227,18 @@ produces the correct diff with zero Cloudflare calls.
 Phase 4 (built in the sibling AloBot repo, not here): added `GET /domains`
 to this service's API — see the note above — while wiring up the Telegram
 bot's "مدیریت DNS" module.
+
+Phase 5: deployment finalized. `docker-compose.yml` no longer publishes a
+host port for `dns-switcher` (was `8000:8000`) — that contradicted this
+file's own "not exposed publicly" rule, since anyone reaching the host's
+port 8000 could hit the API, with only the shared secret (not network
+isolation) as defense. AloBot's `docker-compose.yml` (sibling repo) joins
+`dns-switcher-net` as an external network so it can still reach this
+service by container name. Added `scripts/sync.py` — there was no way to
+actually run "the initial Cloudflare sync" the runbook needed to describe,
+since `SyncService` (Phase 2) had never been wired to a CLI entrypoint or
+API route. See `RUNBOOK.md` for first-time setup, token rotation, reading
+the audit log directly from Postgres, and rolling back a change manually
+via the API when Telegram is unreachable — all verified against the real
+containers, including AloBot successfully reaching `dns-switcher` by name
+across the shared network.

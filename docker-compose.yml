@@ -7,8 +7,10 @@ services:
       - .env
     environment:
       DATABASE_URL: postgresql+asyncpg://dns_switcher:dns_switcher@db:5432/dns_switcher
-    ports:
-      - "8000:8000"
+    # No host port published on purpose -- this API must only be reachable
+    # from other containers on dns-switcher-net (see CLAUDE.md). For local
+    # debugging, use `docker compose exec dns-switcher python -c "..."`
+    # (see RUNBOOK.md) rather than exposing the port.
     depends_on:
       db:
         condition: service_healthy
