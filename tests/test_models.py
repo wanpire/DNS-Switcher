@@ -14,6 +14,7 @@ from app.models import (
     RecordType,
     SwitchGroup,
     SwitchGroupMember,
+    TargetDatacenterIp,
 )
 
 
@@ -78,7 +79,6 @@ async def test_restrict_delete_datacenter_referenced_by_audit_log(session):
             action_type=ActionType.single,
             previous_datacenter_id=dc1.id,
             new_datacenter_id=dc2.id,
-            cloudflare_record_id="rec-1",
             status=AuditStatus.success,
         )
     )
@@ -146,7 +146,6 @@ async def test_delete_dns_target_sets_null_on_audit_log(session):
         dns_target_id=target.id,
         previous_datacenter_id=dc1.id,
         new_datacenter_id=dc2.id,
-        cloudflare_record_id="rec-1",
         status=AuditStatus.success,
     )
     session.add(entry)
@@ -172,7 +171,6 @@ async def test_delete_switch_group_sets_null_on_audit_log(session):
         switch_group_id=group.id,
         previous_datacenter_id=dc1.id,
         new_datacenter_id=dc2.id,
-        cloudflare_record_id="rec-1",
         status=AuditStatus.success,
     )
     session.add(entry)
@@ -207,3 +205,54 @@ async def test_switch_group_member_ordering(session):
     )
     loaded = result.scalar_one()
     assert [m.dns_target_id for m in loaded.members] == [t1.id, t2.id]
+
+
+async def test_target_datacenter_ip_unique_slot(session):
+    domain = await _make_domain(session)
+    dc = await _make_datacenter(session)
+    target = DnsTarget(domain_id=domain.id, name="www", record_type=RecordType.A)
+    session.add(target)
+    await session.flush()
+    session.add_all(
+        [
+            TargetDatacenterIp(dns_target_id=target.id, datacenter_id=dc.id, slot_index=0, ip_address="1.1.1.1"),
+            TargetDatacenterIp(dns_target_id=target.id, datacenter_id=dc.id, slot_index=0, ip_address="1.1.1.2"),
+        ]
+    )
+    with pytest.raises(IntegrityError):
+        await session.commit()
+
+
+async def test_cascade_delete_dns_target_removes_datacenter_ips(session):
+    domain = await _make_domain(session)
+    dc = await _make_datacenter(session)
+    target = DnsTarget(domain_id=domain.id, name="www", record_type=RecordType.A)
+    session.add(target)
+    await session.flush()
+    session.add(
+        TargetDatacenterIp(dns_target_id=target.id, datacenter_id=dc.id, slot_index=0, ip_address="1.1.1.1")
+    )
+    await session.commit()
+
+    await session.execute(text("DELETE FROM dns_targets WHERE id = :id"), {"id": target.id})
+    await session.commit()
+
+    result = await session.execute(select(TargetDatacenterIp))
+    assert result.scalars().all() == []
+
+
+async def test_restrict_delete_datacenter_referenced_by_target_datacenter_ip(session):
+    domain = await _make_domain(session)
+    dc = await _make_datacenter(session)
+    target = DnsTarget(domain_id=domain.id, name="www", record_type=RecordType.A)
+    session.add(target)
+    await session.flush()
+    session.add(
+        TargetDatacenterIp(dns_target_id=target.id, datacenter_id=dc.id, slot_index=0, ip_address="1.1.1.1")
+    )
+    await session.commit()
+
+    with pytest.raises(IntegrityError):
+        await session.execute(text("DELETE FROM datacenters WHERE id = :id"), {"id": dc.id})
+        await session.commit()
+    await session.rollback()

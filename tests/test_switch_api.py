@@ -7,7 +7,7 @@ from app.api.deps import get_cloudflare_client
 from app.cloudflare.client import CloudflareClient
 from app.db.session import get_db
 from app.main import app
-from app.models import Datacenter, DnsTarget, Domain, RecordType, SwitchGroup, SwitchGroupMember
+from app.models import Datacenter, DnsTarget, Domain, RecordType, SwitchGroup, SwitchGroupMember, TargetDatacenterIp
 
 BASE = "https://api.cloudflare.com/client/v4"
 # Matches INTERNAL_API_SHARED_SECRET as set in the test run's environment.
@@ -25,24 +25,27 @@ async def _make_domain(session, name="example.com", zone="zone-1"):
     return domain
 
 
-async def _make_datacenter(session, name, ip):
-    dc = Datacenter(name=name, ip_address=ip)
+async def _make_datacenter(session, name):
+    dc = Datacenter(name=name)
     session.add(dc)
     await session.flush()
     return dc
 
 
-async def _make_target(session, domain, dc=None, name="www", cf_record_id="cf-1"):
-    target = DnsTarget(
-        domain_id=domain.id,
-        name=name,
-        record_type=RecordType.A,
-        cloudflare_record_id=cf_record_id,
-        current_datacenter_id=dc.id if dc else None,
-    )
+async def _make_target(session, domain, name="www"):
+    target = DnsTarget(domain_id=domain.id, name=name, record_type=RecordType.A)
     session.add(target)
     await session.flush()
     return target
+
+
+async def _add_ip(session, target, dc, ip, record_id=None):
+    session.add(
+        TargetDatacenterIp(
+            dns_target_id=target.id, datacenter_id=dc.id, slot_index=0, ip_address=ip, cloudflare_record_id=record_id
+        )
+    )
+    await session.flush()
 
 
 @pytest_asyncio.fixture
@@ -76,8 +79,11 @@ async def test_wrong_secret_header_returns_401(api_client):
 
 async def test_list_targets_groups_datacenters(session, api_client):
     domain = await _make_domain(session)
-    dc = await _make_datacenter(session, "dc1", "1.1.1.1")
-    target = await _make_target(session, domain, dc)
+    dc = await _make_datacenter(session, "dc1")
+    target = await _make_target(session, domain)
+    await _add_ip(session, target, dc, "1.1.1.1", "cf-1")
+    target.current_datacenter_id = dc.id
+    await session.flush()
     group = SwitchGroup(name="group1")
     session.add(group)
     await session.flush()
@@ -97,7 +103,6 @@ async def test_list_targets_groups_datacenters(session, api_client):
 
     dc_resp = await api_client.get("/datacenters", headers=headers)
     assert dc_resp.status_code == 200
-    assert dc_resp.json()[0]["ip_address"] == "1.1.1.1"
     assert dc_resp.json()[0]["status"] == "active"
 
     domains_resp = await api_client.get("/domains", headers=headers)
@@ -108,9 +113,13 @@ async def test_list_targets_groups_datacenters(session, api_client):
 @respx.mock
 async def test_plan_and_execute_single_switch_via_api(session, api_client):
     domain = await _make_domain(session)
-    dc1 = await _make_datacenter(session, "dc1", "1.1.1.1")
-    dc2 = await _make_datacenter(session, "dc2", "2.2.2.2")
-    target = await _make_target(session, domain, dc1)
+    dc1 = await _make_datacenter(session, "dc1")
+    dc2 = await _make_datacenter(session, "dc2")
+    target = await _make_target(session, domain)
+    await _add_ip(session, target, dc1, "1.1.1.1", "cf-1")
+    await _add_ip(session, target, dc2, "2.2.2.2")
+    target.current_datacenter_id = dc1.id
+    await session.flush()
 
     headers = {"X-Internal-Secret": SECRET}
 
@@ -121,9 +130,9 @@ async def test_plan_and_execute_single_switch_via_api(session, api_client):
     )
     assert plan_resp.status_code == 200
     body = plan_resp.json()
-    assert body["current_content"] == "1.1.1.1"
-    assert body["new_content"] == "2.2.2.2"
+    assert body["slot_diffs"] == [{"slot_index": 0, "current_ip": "1.1.1.1", "new_ip": "2.2.2.2"}]
     assert body["no_op"] is False
+    assert body["slot_count_mismatch"] is False
 
     respx.get(f"{BASE}/zones/zone-1/dns_records/cf-1").mock(
         return_value=_cf_ok({"id": "cf-1", "content": "1.1.1.1"})
@@ -142,13 +151,14 @@ async def test_plan_and_execute_single_switch_via_api(session, api_client):
     assert exec_body["success"] is True
     assert exec_body["skipped"] is False
     assert exec_body["audit_log_entry_id"] is not None
+    assert exec_body["slot_results"][0]["action"] == "updated"
 
     await session.refresh(target)
     assert target.current_datacenter_id == dc2.id
 
 
 async def test_plan_single_switch_unknown_target_returns_400(session, api_client):
-    dc = await _make_datacenter(session, "dc1", "1.1.1.1")
+    dc = await _make_datacenter(session, "dc1")
     headers = {"X-Internal-Secret": SECRET}
     resp = await api_client.post(
         "/switch/single/plan",
@@ -158,12 +168,41 @@ async def test_plan_single_switch_unknown_target_returns_400(session, api_client
     assert resp.status_code == 400
 
 
+async def test_execute_single_switch_slot_mismatch_requires_confirmation(session, api_client):
+    domain = await _make_domain(session)
+    dc1 = await _make_datacenter(session, "dc1")
+    dc2 = await _make_datacenter(session, "dc2")
+    target = await _make_target(session, domain)
+    await _add_ip(session, target, dc1, "1.1.1.1", "cf-1")
+    session.add_all(
+        [
+            TargetDatacenterIp(dns_target_id=target.id, datacenter_id=dc2.id, slot_index=0, ip_address="2.2.2.1"),
+            TargetDatacenterIp(dns_target_id=target.id, datacenter_id=dc2.id, slot_index=1, ip_address="2.2.2.2"),
+        ]
+    )
+    target.current_datacenter_id = dc1.id
+    await session.flush()
+
+    headers = {"X-Internal-Secret": SECRET}
+    resp = await api_client.post(
+        "/switch/single/execute",
+        json={"dns_target_id": target.id, "target_datacenter_id": dc2.id, "actor": "alice"},
+        headers=headers,
+    )
+    assert resp.status_code == 400
+    assert "allow_slot_count_mismatch" in resp.json()["detail"]
+
+
 @respx.mock
 async def test_rollback_via_api(session, api_client):
     domain = await _make_domain(session)
-    dc1 = await _make_datacenter(session, "dc1", "1.1.1.1")
-    dc2 = await _make_datacenter(session, "dc2", "2.2.2.2")
-    target = await _make_target(session, domain, dc1)
+    dc1 = await _make_datacenter(session, "dc1")
+    dc2 = await _make_datacenter(session, "dc2")
+    target = await _make_target(session, domain)
+    await _add_ip(session, target, dc1, "1.1.1.1", "cf-1")
+    await _add_ip(session, target, dc2, "2.2.2.2")
+    target.current_datacenter_id = dc1.id
+    await session.flush()
 
     headers = {"X-Internal-Secret": SECRET}
 
@@ -202,9 +241,13 @@ async def test_rollback_via_api(session, api_client):
 @respx.mock
 async def test_audit_log_pagination_and_filtering(session, api_client):
     domain = await _make_domain(session)
-    dc1 = await _make_datacenter(session, "dc1", "1.1.1.1")
-    dc2 = await _make_datacenter(session, "dc2", "2.2.2.2")
-    target = await _make_target(session, domain, dc1)
+    dc1 = await _make_datacenter(session, "dc1")
+    dc2 = await _make_datacenter(session, "dc2")
+    target = await _make_target(session, domain)
+    await _add_ip(session, target, dc1, "1.1.1.1", "cf-1")
+    await _add_ip(session, target, dc2, "2.2.2.2")
+    target.current_datacenter_id = dc1.id
+    await session.flush()
 
     headers = {"X-Internal-Secret": SECRET}
 

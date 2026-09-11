@@ -28,7 +28,6 @@ class DnsTarget(Base):
     record_type: Mapped[RecordType] = mapped_column(
         SAEnum(RecordType, name="dns_record_type"), nullable=False
     )
-    cloudflare_record_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     current_datacenter_id: Mapped[int | None] = mapped_column(
         ForeignKey("datacenters.id", ondelete="RESTRICT"), nullable=True, index=True
     )
@@ -37,4 +36,9 @@ class DnsTarget(Base):
     domain: Mapped["Domain"] = relationship(back_populates="dns_targets")
     current_datacenter: Mapped["Datacenter | None"] = relationship(
         back_populates="dns_targets"
+    )
+    datacenter_ips: Mapped[list["TargetDatacenterIp"]] = relationship(
+        back_populates="dns_target",
+        cascade="all, delete-orphan",
+        order_by="TargetDatacenterIp.datacenter_id, TargetDatacenterIp.slot_index",
     )

@@ -2,6 +2,7 @@ import enum
 from datetime import datetime
 
 from sqlalchemy import DateTime, Enum as SAEnum, ForeignKey, String, Text, func
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.session import Base
@@ -42,7 +43,12 @@ class AuditLogEntry(Base):
     new_datacenter_id: Mapped[int] = mapped_column(
         ForeignKey("datacenters.id", ondelete="RESTRICT"), nullable=False
     )
-    cloudflare_record_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    # One entry per slot actually touched: {"slot_index", "ip_address",
+    # "cloudflare_record_id", "action" (updated|created|deleted|skipped),
+    # "success", "error"}. A single-slot target still gets a one-element
+    # list -- there is no longer a single cloudflare_record_id to point at
+    # once a target can have more than one simultaneous record.
+    slot_results: Mapped[list | None] = mapped_column(JSONB, nullable=True)
     status: Mapped[AuditStatus] = mapped_column(
         SAEnum(AuditStatus, name="audit_status"), nullable=False
     )

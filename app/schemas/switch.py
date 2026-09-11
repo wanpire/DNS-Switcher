@@ -11,7 +11,6 @@ class DatacenterOut(BaseModel):
     id: int
     name: str
     status: DatacenterStatus
-    ip_address: str | None
     notes: str | None
 
 
@@ -30,7 +29,6 @@ class DnsTargetOut(BaseModel):
     domain_id: int
     name: str
     record_type: RecordType
-    cloudflare_record_id: str | None
     current_datacenter_id: int | None
     proxied: bool
 
@@ -42,6 +40,14 @@ class SwitchGroupOut(BaseModel):
     member_dns_target_ids: list[int]
 
 
+class SlotDiffOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    slot_index: int
+    current_ip: str | None
+    new_ip: str | None
+
+
 class SwitchPlanOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -49,9 +55,9 @@ class SwitchPlanOut(BaseModel):
     fqdn: str
     record_type: str
     current_datacenter_id: int | None
-    current_content: str | None
     target_datacenter_id: int
-    new_content: str
+    slot_diffs: list[SlotDiffOut]
+    slot_count_mismatch: bool
     no_op: bool
 
 
@@ -64,6 +70,7 @@ class SingleSwitchExecuteRequest(BaseModel):
     dns_target_id: int
     target_datacenter_id: int
     actor: str
+    allow_slot_count_mismatch: bool = False
 
 
 class BulkSwitchPlanRequest(BaseModel):
@@ -81,12 +88,22 @@ class RollbackRequest(BaseModel):
     actor: str
 
 
+class SlotResultOut(BaseModel):
+    slot_index: int
+    ip_address: str | None
+    cloudflare_record_id: str | None
+    action: str | None
+    success: bool
+    error: str | None
+
+
 class SwitchExecutionOut(BaseModel):
     dns_target_id: int
     success: bool
     skipped: bool
     error_message: str | None
     audit_log_entry_id: int | None
+    slot_results: list[SlotResultOut]
 
 
 class BulkSwitchExecutionOut(BaseModel):
@@ -108,7 +125,7 @@ class AuditLogEntryOut(BaseModel):
     switch_group_id: int | None
     previous_datacenter_id: int | None
     new_datacenter_id: int
-    cloudflare_record_id: str
+    slot_results: list[dict] | None
     status: AuditStatus
     error_message: str | None
     rollback_of_id: int | None

@@ -46,8 +46,7 @@ of what either project calls its own database service.
 
 3. Seed your real domains and datacenters. Copy the example file (kept out
    of git) and fill in real values -- Cloudflare zone IDs (Cloudflare
-   dashboard > your domain > Overview, right sidebar) and each
-   datacenter's IP:
+   dashboard > your domain > Overview, right sidebar):
 
    ```
    cp scripts/seed.example.yaml scripts/seed.local.yaml
@@ -55,37 +54,42 @@ of what either project calls its own database service.
    docker compose exec dns-switcher python -m scripts.seed --file scripts/seed.local.yaml
    ```
 
-   You'll also need `DnsTarget` rows for every subdomain you want to
-   manage -- there's no bulk-import script for these yet, only the
-   seed script's domains/datacenters coverage. Insert them directly via
-   `docker compose exec postgres psql -U dns_switcher -d dns_switcher`, e.g.:
+   Datacenters no longer carry a single IP here -- real services have a
+   distinct IP per datacenter, not one global IP per datacenter. Just seed
+   `id`/`name`/`status`/`notes`; per-target IPs come from the next step.
 
-   ```sql
-   INSERT INTO dns_targets (domain_id, name, record_type, proxied)
-   VALUES (1, 'www', 'A', false);
+4. Import the real topology from a CSV (columns: `domain`, `subdomain`,
+   `record_type`, `service`, `<datacenter-name>_ips` per datacenter --
+   comma-separated within a cell for a load-balanced target with more than
+   one simultaneous record). This is the authoritative source for
+   `DnsTarget` + `TargetDatacenterIp` rows -- there's no manual-insert path
+   for these, since every row needs cross-checking against Cloudflare
+   first:
+
+   ```
+   docker compose exec dns-switcher python -m scripts.import_topology --csv topology.csv
    ```
 
-   Leave `cloudflare_record_id` and `current_datacenter_id` unset -- the
-   next step fills the former in, and the sync step's mismatch report
-   tells you the correct value to set for the latter.
+   Always read-only by default: prints a per-row report (matched / not
+   matched / partial / ambiguous) cross-checked against live Cloudflare
+   records, and writes nothing. Review it, then re-run with `--apply` to
+   write the cleanly-matched rows (and create the corresponding
+   SwitchGroups from the CSV's `service` column) -- rows that didn't match
+   cleanly are skipped and listed for manual follow-up, never guessed at.
 
-4. Run the initial Cloudflare sync. This matches each `DnsTarget` to its
-   real Cloudflare record by name+type, fills in `cloudflare_record_id`,
-   and reports (without changing) any target whose `current_datacenter_id`
-   doesn't match what Cloudflare's record content actually resolves to --
-   expected for every target on a first run, since none has a
-   `current_datacenter_id` set yet:
+   Ongoing drift detection on already-imported targets (e.g. someone
+   changed a record by hand in the Cloudflare dashboard) is a separate,
+   repeatable step:
 
    ```
    docker compose exec dns-switcher python -m scripts.sync
    ```
 
-   Read its "datacenter mismatches" output and set each target's
-   `current_datacenter_id` accordingly via psql (matching the resolved
-   datacenter it reports) before doing any switch through the API/bot --
-   `execute_single_switch`/`execute_bulk_switch` always re-derive their
-   diff from `current_datacenter_id`, so a stale or missing value there
-   produces a misleading dry-run.
+   It fills in any newly-live `cloudflare_record_id`s and reports (without
+   changing) any target whose `current_datacenter_id` doesn't match what's
+   actually live -- `execute_single_switch`/`execute_bulk_switch` always
+   re-derive their diff from `current_datacenter_id`, so a stale value
+   there produces a misleading dry-run.
 
 ## Rotating the Cloudflare API token
 

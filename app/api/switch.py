@@ -34,6 +34,7 @@ def _to_execution_out(result) -> SwitchExecutionOut:
         skipped=result.skipped,
         error_message=result.error_message,
         audit_log_entry_id=result.audit_log_entry.id if result.audit_log_entry else None,
+        slot_results=result.slot_results,
     )
 
 
@@ -101,7 +102,10 @@ async def execute_single_switch(
     service = SwitchService(session, cf)
     try:
         result = await service.execute_single_switch(
-            body.dns_target_id, body.target_datacenter_id, body.actor
+            body.dns_target_id,
+            body.target_datacenter_id,
+            body.actor,
+            allow_slot_count_mismatch=body.allow_slot_count_mismatch,
         )
     except SwitchValidationError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc

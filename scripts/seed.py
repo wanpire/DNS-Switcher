@@ -38,20 +38,16 @@ async def upsert_datacenter(
     name: str,
     status: str,
     notes: str | None,
-    ip_address: str | None = None,
 ) -> Datacenter:
     result = await session.execute(select(Datacenter).where(Datacenter.name == name))
     datacenter = result.scalar_one_or_none()
     if datacenter is None:
-        datacenter = Datacenter(
-            name=name, status=DatacenterStatus(status), notes=notes, ip_address=ip_address
-        )
+        datacenter = Datacenter(name=name, status=DatacenterStatus(status), notes=notes)
         session.add(datacenter)
         print(f"  + datacenter {name} ({status})")
     else:
         datacenter.status = DatacenterStatus(status)
         datacenter.notes = notes
-        datacenter.ip_address = ip_address
         print(f"  = datacenter {name} (updated)")
     return datacenter
 
@@ -67,7 +63,6 @@ async def seed_from_file(path: Path) -> None:
                 dc["name"],
                 dc.get("status", "active"),
                 dc.get("notes"),
-                dc.get("ip_address"),
             )
         await session.commit()
 
@@ -94,9 +89,8 @@ async def seed_interactive() -> None:
             if not name:
                 break
             status = _prompt("  status (active|standby|disabled)", "active")
-            ip_address = _prompt("  ip_address") or None
             notes = _prompt("  notes") or None
-            await upsert_datacenter(session, name, status, notes, ip_address)
+            await upsert_datacenter(session, name, status, notes)
 
         await session.commit()
     print("Done.")

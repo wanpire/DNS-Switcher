@@ -82,6 +82,15 @@ async def test_create_dns_record_success(client):
 
 
 @respx.mock
+async def test_delete_dns_record_success(client):
+    respx.delete(f"{BASE}/zones/zone-1/dns_records/rec1").mock(
+        return_value=httpx.Response(200, json={"success": True, "result": {"id": "rec1"}})
+    )
+    record = await client.delete_dns_record("zone-1", "rec1")
+    assert record == {"id": "rec1"}
+
+
+@respx.mock
 async def test_retries_on_429_then_succeeds(client):
     route = respx.get(f"{BASE}/zones/zone-1/dns_records/rec1").mock(
         side_effect=[

@@ -7,12 +7,13 @@ domains:
   - name: example.net # PLACEHOLDER — replace with your second domain
     cloudflare_zone_id: PLACEHOLDER_ZONE_ID_2
 
+# Datacenters no longer carry a single IP here -- each DnsTarget has its
+# own 1..N IPs per datacenter (TargetDatacenterIp), seeded separately via
+# scripts/import_topology.py from a CSV, not this file.
 datacenters:
   - name: dc-primary # PLACEHOLDER — replace with your real datacenter name
     status: active
-    ip_address: 203.0.113.1 # PLACEHOLDER — replace with the real IP
     notes: Primary datacenter
   - name: dc-secondary # PLACEHOLDER
     status: standby
-    ip_address: 203.0.113.2 # PLACEHOLDER
     notes: Standby / failover datacenter

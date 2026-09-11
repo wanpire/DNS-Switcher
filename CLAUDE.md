@@ -30,11 +30,18 @@ docker-compose, separate from any other service on the host.
 ## Data model
 
 - **Datacenter**: `id`, `name` (unique), `status` (active | standby |
-  disabled), `notes`, `ip_address` (nullable — added in Phase 2; see below)
+  disabled), `notes`. No IP here — see `TargetDatacenterIp` below.
 - **Domain**: `id`, `name` (e.g. `example.com`), `cloudflare_zone_id`
 - **DnsTarget**: `id`, `domain_id` (FK), `name` (subdomain or `@` for root),
-  `record_type` (A | AAAA | CNAME), `cloudflare_record_id` (nullable until
-  first sync), `current_datacenter_id` (FK, nullable), `proxied` (bool)
+  `record_type` (A | AAAA | CNAME), `current_datacenter_id` (FK, nullable),
+  `proxied` (bool)
+- **TargetDatacenterIp**: `id`, `dns_target_id` (FK), `datacenter_id` (FK),
+  `slot_index`, `ip_address`, `cloudflare_record_id` (nullable — populated
+  only when this slot is the one currently live). A DnsTarget has 1..N of
+  these per Datacenter: real services have a *distinct* IP per datacenter
+  (not one global IP per datacenter), and a load-balanced target can have
+  more than one simultaneous A/AAAA record, ordered by `slot_index`. See
+  "Multi-IP topology" below.
 - **SwitchGroup**: `id`, `name`, `description` — a named, ordered set of
   DnsTarget rows that get switched together in one bulk action
 - **SwitchGroupMember**: `switch_group_id` (FK), `dns_target_id` (FK) — join
@@ -42,25 +49,20 @@ docker-compose, separate from any other service on the host.
 - **AuditLogEntry**: `id`, `created_at`, `actor` (Telegram user id/username),
   `action_type` (single | bulk | rollback), `dns_target_id` (nullable FK),
   `switch_group_id` (nullable FK), `previous_datacenter_id` (nullable FK —
-  see Phase 3 note below), `new_datacenter_id`, `cloudflare_record_id`,
+  see Phase 3 note below), `new_datacenter_id`, `slot_results` (JSONB,
+  nullable — one entry per slot actually touched, see below),
   `status` (success | failed | rolled_back), `error_message` (nullable),
   `rollback_of_id` (nullable, self-referential FK — added in Phase 3)
 
-Deleting a Datacenter that is still referenced (by a DnsTarget or an
-AuditLogEntry) must be restricted, not cascaded — history and current
-pointers must never silently lose their target.
+Deleting a Datacenter that is still referenced (by a DnsTarget, a
+TargetDatacenterIp, or an AuditLogEntry) must be restricted, not cascaded —
+history and current pointers must never silently lose their target.
 
 This model is implemented starting in Phase 1; this scaffold (Phase 0) has
 no models yet.
 
-`Datacenter.ip_address` was added in Phase 2, not Phase 1: reconciling what
-Cloudflare actually reports for a record against our notion of "which
-datacenter is this pointing at" requires knowing each datacenter's IP, and
-the original Phase 1 field list omitted it. It's nullable since a
-Datacenter can exist before its IP is known.
-
-Two more fixes landed in Phase 3, once the switch/rollback logic exposed
-gaps in the Phase 1 field list:
+Two fixes landed in Phase 3, once the switch/rollback logic exposed gaps in
+the Phase 1 field list:
 
 - `previous_datacenter_id` was originally `NOT NULL`, but a DnsTarget's
   very first switch has no prior datacenter to record (it may never have
@@ -70,6 +72,41 @@ gaps in the Phase 1 field list:
   entry it's undoing, per the explicit requirement that rollback "logs a
   new AuditLogEntry that references the original entry" — there was no
   field for that link before.
+
+## Multi-IP topology
+
+The real topology has one IP *per service per datacenter*, not one global
+IP per datacenter — `Datacenter.ip_address` (Phase 2) was wrong and has
+been removed. `TargetDatacenterIp` replaces it: each `DnsTarget` carries
+its own ordered list of candidate IPs per `Datacenter`, 1..N long
+(load-balanced targets have more than one simultaneous record).
+
+`slot_index` is what lets a switch reuse a Cloudflare record across
+datacenters instead of always creating/deleting: slot *i* at the source
+datacenter and slot *i* at the destination are treated as "the same
+physical record" — `execute_single_switch` PATCHes that record's content
+rather than deleting and recreating it, as long as the source and
+destination have the same number of slots. When slot counts differ, the
+switch would have to create or delete records, which never happens
+silently — see `SwitchService.execute_single_switch`'s
+`allow_slot_count_mismatch` parameter (default `False`, raises
+`SwitchValidationError` describing exactly what differs).
+
+`AuditLogEntry.cloudflare_record_id` (a single value) doesn't make sense
+once a switch can touch N records, so it's gone too, replaced by
+`slot_results`: a JSON list of `{slot_index, ip_address,
+cloudflare_record_id, action (updated|created|deleted|skipped), success,
+error}`, one entry per slot actually touched by that switch.
+
+`app/services/reconciliation.py` holds the core "match candidate IPs
+against live Cloudflare records" logic, shared by two callers with
+different sources for the candidates: `SyncService` (already-seeded
+DnsTarget rows, ongoing drift detection) and `app/services/
+topology_import.py` (a CSV of the authoritative desired topology,
+read-only reconciliation for rows that don't exist as DnsTarget rows yet —
+see `scripts/import_topology.py` and its `RUNBOOK.md` entry). Both flag
+partial matches (e.g. only one of two load-balanced records found live)
+rather than treating them as either a clean match or a clean non-match.
 
 ## Cloudflare rate limits — respect these everywhere
 
@@ -244,3 +281,15 @@ the audit log directly from Postgres, and rolling back a change manually
 via the API when Telegram is unreachable — all verified against the real
 containers, including AloBot successfully reaching `dns-switcher` by name
 across the shared network.
+
+Post-Phase-5 correction (real topology data): `Datacenter.ip_address`
+(Phase 2) was wrong — replaced by `TargetDatacenterIp` (1..N IPs per
+DnsTarget per Datacenter, load-balanced targets included). `switch_service`
+and `sync_service` were rewritten around it (see "Multi-IP topology"
+above); `app/services/topology_import.py` + `scripts/import_topology.py`
+add the CSV-driven reconciliation-then-seed workflow. 54 tests passing.
+**Not yet deployed to production** as of this change: AloBot's
+`dns_admin.py` still renders the old single-IP `SwitchPlanOut` shape
+(`current_content`/`new_content`), so deploying this dns-switcher version
+before AloBot's rendering is updated would break the live "🌐 مدیریت DNS"
+panel mid-use. Deploy both together, not this one alone.

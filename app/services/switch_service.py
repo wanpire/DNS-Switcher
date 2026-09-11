@@ -1,11 +1,19 @@
 """Single and bulk DNS datacenter switching, with dry-run plans and rollback.
 
-Golden rule: no DNS write happens without first computing a diff. plan_*
-never calls Cloudflare -- it diffs purely against DB state (current
-datacenter's ip_address -> target datacenter's ip_address). execute_*
+A DnsTarget can have 1..N simultaneous IPs per datacenter (TargetDatacenterIp,
+ordered by slot_index) -- load-balanced targets have more than one. Golden
+rule: no DNS write happens without first computing a diff. plan_* never
+calls Cloudflare -- it diffs purely against DB state, per slot. execute_*
 always re-derives its own plan internally rather than trusting a
 caller-supplied target, then checks Cloudflare's live record content before
-writing, so an already-correct record is a no-op (still logged).
+writing each slot, so an already-correct slot is a no-op (still logged).
+
+When the source and destination datacenter have the same number of IP
+slots, a switch reuses each slot's existing Cloudflare record (PATCHing its
+content) rather than creating/deleting -- cheaper and preserves the
+record's Cloudflare-side history. When slot counts differ, execute_*
+refuses by default (SwitchValidationError) rather than silently creating or
+deleting records; pass allow_slot_count_mismatch=True to confirm.
 """
 
 import asyncio
@@ -26,6 +34,7 @@ from app.models import (
     DnsTarget,
     Domain,
     SwitchGroup,
+    TargetDatacenterIp,
 )
 from app.services.sync_service import target_fqdn
 
@@ -33,7 +42,16 @@ logger = logging.getLogger(__name__)
 
 
 class SwitchValidationError(Exception):
-    """Raised when a switch can't even be attempted (bad input, unsynced target, etc)."""
+    """Raised when a switch can't even be attempted (bad input, no configured
+    IPs, an unconfirmed slot-count mismatch, etc)."""
+
+
+@dataclass
+class SlotDiff:
+    slot_index: int
+    current_ip: str | None
+    new_ip: str | None
+    cloudflare_record_id: str | None  # the live record at this slot in the source datacenter, if any
 
 
 @dataclass
@@ -41,12 +59,11 @@ class SwitchPlan:
     dns_target_id: int
     fqdn: str
     record_type: str
-    cloudflare_record_id: str
     proxied: bool
     current_datacenter_id: int | None
-    current_content: str | None
     target_datacenter_id: int
-    new_content: str
+    slot_diffs: list[SlotDiff]
+    slot_count_mismatch: bool
     no_op: bool
 
 
@@ -56,6 +73,7 @@ class SwitchExecutionResult:
     success: bool
     skipped: bool
     audit_log_entry: AuditLogEntry | None
+    slot_results: list[dict] = field(default_factory=list)
     error_message: str | None = None
 
 
@@ -79,6 +97,19 @@ class SwitchService:
         self._session = session
         self._client = cloudflare_client
 
+    async def _get_slots(
+        self, dns_target_id: int, datacenter_id: int
+    ) -> list[TargetDatacenterIp]:
+        result = await self._session.execute(
+            select(TargetDatacenterIp)
+            .where(
+                TargetDatacenterIp.dns_target_id == dns_target_id,
+                TargetDatacenterIp.datacenter_id == datacenter_id,
+            )
+            .order_by(TargetDatacenterIp.slot_index)
+        )
+        return list(result.scalars().all())
+
     async def plan_single_switch(self, dns_target_id: int, target_datacenter_id: int) -> SwitchPlan:
         target = await self._session.get(DnsTarget, dns_target_id)
         if target is None:
@@ -87,35 +118,47 @@ class SwitchService:
         target_dc = await self._session.get(Datacenter, target_datacenter_id)
         if target_dc is None:
             raise SwitchValidationError(f"Datacenter {target_datacenter_id} not found")
-        if not target_dc.ip_address:
-            raise SwitchValidationError(
-                f"Datacenter '{target_dc.name}' has no ip_address configured"
-            )
-        if target.cloudflare_record_id is None:
-            raise SwitchValidationError(
-                f"DnsTarget {dns_target_id} has not been synced with Cloudflare yet "
-                "(no cloudflare_record_id) -- run a sync first"
-            )
 
         domain = await self._session.get(Domain, target.domain_id)
         fqdn = target_fqdn(target.name, domain.name)
 
-        current_dc = None
+        dest_slots = await self._get_slots(dns_target_id, target_datacenter_id)
+        if not dest_slots:
+            raise SwitchValidationError(
+                f"No IPs configured for DnsTarget {dns_target_id} at datacenter "
+                f"'{target_dc.name}'"
+            )
+
+        source_slots: list[TargetDatacenterIp] = []
         if target.current_datacenter_id is not None:
-            current_dc = await self._session.get(Datacenter, target.current_datacenter_id)
-        current_content = current_dc.ip_address if current_dc else None
+            source_slots = await self._get_slots(dns_target_id, target.current_datacenter_id)
+
+        slot_count = max(len(source_slots), len(dest_slots))
+        slot_diffs = [
+            SlotDiff(
+                slot_index=i,
+                current_ip=source_slots[i].ip_address if i < len(source_slots) else None,
+                new_ip=dest_slots[i].ip_address if i < len(dest_slots) else None,
+                cloudflare_record_id=(
+                    source_slots[i].cloudflare_record_id if i < len(source_slots) else None
+                ),
+            )
+            for i in range(slot_count)
+        ]
 
         return SwitchPlan(
             dns_target_id=target.id,
             fqdn=fqdn,
             record_type=target.record_type.value,
-            cloudflare_record_id=target.cloudflare_record_id,
             proxied=target.proxied,
             current_datacenter_id=target.current_datacenter_id,
-            current_content=current_content,
             target_datacenter_id=target_dc.id,
-            new_content=target_dc.ip_address,
-            no_op=(current_content == target_dc.ip_address),
+            slot_diffs=slot_diffs,
+            slot_count_mismatch=(len(source_slots) != len(dest_slots)),
+            no_op=(
+                sorted(s.ip_address for s in source_slots)
+                == sorted(s.ip_address for s in dest_slots)
+            ),
         )
 
     async def plan_bulk_switch(
@@ -135,6 +178,33 @@ class SwitchService:
             for member in group.members
         ]
 
+    async def _update_slot_bookkeeping(
+        self,
+        dns_target_id: int,
+        source_datacenter_id: int | None,
+        dest_datacenter_id: int,
+        slot_results: list[dict],
+    ) -> None:
+        """Moves cloudflare_record_id from the source datacenter's slots to
+        the destination's, matching what execute_single_switch actually did
+        to each record (reused via PATCH, newly created, or deleted)."""
+        source_slots = {
+            s.slot_index: s
+            for s in (
+                await self._get_slots(dns_target_id, source_datacenter_id)
+                if source_datacenter_id is not None
+                else []
+            )
+        }
+        dest_slots = {s.slot_index: s for s in await self._get_slots(dns_target_id, dest_datacenter_id)}
+
+        for result_entry in slot_results:
+            slot_index = result_entry["slot_index"]
+            if slot_index in source_slots:
+                source_slots[slot_index].cloudflare_record_id = None
+            if result_entry["action"] in ("updated", "skipped", "created") and slot_index in dest_slots:
+                dest_slots[slot_index].cloudflare_record_id = result_entry["cloudflare_record_id"]
+
     async def execute_single_switch(
         self,
         dns_target_id: int,
@@ -143,54 +213,111 @@ class SwitchService:
         *,
         action_type: ActionType = ActionType.single,
         switch_group_id: int | None = None,
+        allow_slot_count_mismatch: bool = False,
     ) -> SwitchExecutionResult:
         # Re-derive the plan internally -- never trust a caller-supplied diff.
         plan = await self.plan_single_switch(dns_target_id, target_datacenter_id)
 
+        if plan.slot_count_mismatch and not allow_slot_count_mismatch:
+            source_count = sum(1 for d in plan.slot_diffs if d.current_ip is not None)
+            dest_count = sum(1 for d in plan.slot_diffs if d.new_ip is not None)
+            raise SwitchValidationError(
+                f"DnsTarget {dns_target_id}: source datacenter has {source_count} IP(s), "
+                f"destination has {dest_count} -- this switch would create or delete "
+                "records, not just update content. Pass allow_slot_count_mismatch=True "
+                "to confirm."
+            )
+
         target = await self._session.get(DnsTarget, dns_target_id)
         domain = await self._session.get(Domain, target.domain_id)
 
-        live_record = await self._client.get_dns_record(
-            domain.cloudflare_zone_id, plan.cloudflare_record_id
-        )
-        live_content = live_record.get("content")
+        slot_results: list[dict] = []
+        all_ok = True
 
-        error_message: str | None = None
-        skipped = live_content == plan.new_content
-        if not skipped:
+        for slot_diff in plan.slot_diffs:
+            entry: dict = {
+                "slot_index": slot_diff.slot_index,
+                "ip_address": slot_diff.new_ip,
+                "cloudflare_record_id": None,
+                "action": None,
+                "success": False,
+                "error": None,
+            }
             try:
-                await self._client.update_dns_record(
-                    domain.cloudflare_zone_id,
-                    plan.cloudflare_record_id,
-                    content=plan.new_content,
-                    proxied=plan.proxied,
-                )
+                if slot_diff.cloudflare_record_id is not None and slot_diff.new_ip is not None:
+                    live_record = await self._client.get_dns_record(
+                        domain.cloudflare_zone_id, slot_diff.cloudflare_record_id
+                    )
+                    entry["cloudflare_record_id"] = slot_diff.cloudflare_record_id
+                    if live_record.get("content") == slot_diff.new_ip:
+                        entry["action"] = "skipped"
+                    else:
+                        await self._client.update_dns_record(
+                            domain.cloudflare_zone_id,
+                            slot_diff.cloudflare_record_id,
+                            content=slot_diff.new_ip,
+                            proxied=target.proxied,
+                        )
+                        entry["action"] = "updated"
+                elif slot_diff.cloudflare_record_id is not None and slot_diff.new_ip is None:
+                    await self._client.delete_dns_record(
+                        domain.cloudflare_zone_id, slot_diff.cloudflare_record_id
+                    )
+                    entry["action"] = "deleted"
+                    entry["ip_address"] = slot_diff.current_ip
+                elif slot_diff.cloudflare_record_id is None and slot_diff.new_ip is not None:
+                    created = await self._client.create_dns_record(
+                        domain.cloudflare_zone_id,
+                        name=plan.fqdn,
+                        type=plan.record_type,
+                        content=slot_diff.new_ip,
+                        proxied=target.proxied,
+                    )
+                    entry["action"] = "created"
+                    entry["cloudflare_record_id"] = created["id"]
+                else:
+                    entry["action"] = "skipped"
+                entry["success"] = True
             except CloudflareApiError as exc:
-                error_message = str(exc)
+                entry["error"] = str(exc)
+                entry["success"] = False
+                all_ok = False
 
-        success = error_message is None
-        if success:
+            slot_results.append(entry)
+
+        if all_ok:
+            await self._update_slot_bookkeeping(
+                dns_target_id, target.current_datacenter_id, target_datacenter_id, slot_results
+            )
             target.current_datacenter_id = target_datacenter_id
 
-        entry = AuditLogEntry(
+        error_message = None
+        if not all_ok:
+            failed = [r for r in slot_results if not r["success"]]
+            error_message = "; ".join(f"slot {r['slot_index']}: {r['error']}" for r in failed)
+
+        audit_entry = AuditLogEntry(
             actor=actor,
             action_type=action_type,
             dns_target_id=target.id,
             switch_group_id=switch_group_id,
             previous_datacenter_id=plan.current_datacenter_id,
             new_datacenter_id=target_datacenter_id,
-            cloudflare_record_id=plan.cloudflare_record_id,
-            status=AuditStatus.success if success else AuditStatus.failed,
+            slot_results=slot_results,
+            status=AuditStatus.success if all_ok else AuditStatus.failed,
             error_message=error_message,
         )
-        self._session.add(entry)
+        self._session.add(audit_entry)
         await self._session.flush()
+
+        skipped = all_ok and all(r["action"] == "skipped" for r in slot_results)
 
         return SwitchExecutionResult(
             dns_target_id=target.id,
-            success=success,
+            success=all_ok,
             skipped=skipped,
-            audit_log_entry=entry,
+            audit_log_entry=audit_entry,
+            slot_results=slot_results,
             error_message=error_message,
         )
 
@@ -206,6 +333,10 @@ class SwitchService:
 
         for i, plan in enumerate(plans):
             try:
+                # Slot-count mismatches are never silently allowed in bulk --
+                # a member that would create/delete records fails cleanly
+                # here and must be handled individually with explicit
+                # confirmation, same reasoning as the single-switch default.
                 result = await self.execute_single_switch(
                     plan.dns_target_id,
                     target_datacenter_id,

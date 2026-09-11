@@ -41,16 +41,16 @@ async def sync_all(domain_name: str | None = None) -> None:
                 continue
 
             print(f"  matched: {len(sync_result.matched_target_ids)}")
-            print(f"  filled cloudflare_record_id: {len(sync_result.filled_record_id_target_ids)}")
+            print(f"  filled cloudflare_record_id (slots): {sync_result.filled_record_id_count}")
             print(f"  unmatched (no Cloudflare record found): {len(sync_result.unmatched_target_ids)}")
             if sync_result.unmatched_target_ids:
                 print(f"    target ids: {sync_result.unmatched_target_ids}")
             print(f"  datacenter mismatches (NOT auto-fixed): {len(sync_result.datacenter_mismatches)}")
             for mismatch in sync_result.datacenter_mismatches:
+                note = " (partially matched)" if mismatch.partial else ""
                 print(
                     f"    - {mismatch.fqdn}: DB says datacenter #{mismatch.expected_datacenter_id}, "
-                    f"Cloudflare content {mismatch.cloudflare_content!r} resolves to "
-                    f"datacenter #{mismatch.resolved_datacenter_id}"
+                    f"Cloudflare resolves to datacenter #{mismatch.resolved_datacenter_id}{note}"
                 )
 
         await session.commit()
