@@ -9,6 +9,29 @@ the API has no host port published on purpose (see `docker-compose.yml`),
 so commands run *inside* the container rather than against `localhost` from
 the host.
 
+## Joining dns-switcher-net from a sibling project
+
+When another project (e.g. AloBot) needs to reach this service by name, it
+joins `dns-switcher-net` as an external network. **Do not** also put that
+project's own services with generic names (`db`, `redis`, `app`, ...) on
+that same network, and don't add anything of this project's own beyond the
+`dns-switcher` app service to it either — this project's own Postgres is
+deliberately isolated on the private `dns-switcher-internal` network
+instead (see `docker-compose.yml`).
+
+This is a real incident, not a hypothetical: the first attempt at this
+integration put AloBot's `bot` service on `dns-switcher-net` while its own
+Postgres service was *also* named `db` — the same service name
+`dns-switcher`'s own Postgres used at the time. Once joined, Docker's DNS
+resolution for the bare hostname `db` from AloBot's `bot` container became
+ambiguous across the two networks, and its connections silently resolved
+to *this* project's Postgres instead of its own, crash-looping the live
+production bot with a misleading `password authentication failed` error
+(looks like a credentials bug; is actually a DNS collision). Fixed by
+moving this project's Postgres off the shared network entirely, so no
+sibling project's service names can ever collide with it again, regardless
+of what either project calls its own database service.
+
 ## First-time setup
 
 1. Copy `.env.example` to `.env` and fill in `CLOUDFLARE_API_TOKEN` and a
@@ -35,7 +58,7 @@ the host.
    You'll also need `DnsTarget` rows for every subdomain you want to
    manage -- there's no bulk-import script for these yet, only the
    seed script's domains/datacenters coverage. Insert them directly via
-   `docker compose exec db psql -U dns_switcher -d dns_switcher`, e.g.:
+   `docker compose exec postgres psql -U dns_switcher -d dns_switcher`, e.g.:
 
    ```sql
    INSERT INTO dns_targets (domain_id, name, record_type, proxied)
@@ -80,7 +103,7 @@ the host.
 ## Reading the audit log directly from Postgres (bot is down)
 
 ```
-docker compose exec db psql -U dns_switcher -d dns_switcher -c "
+docker compose exec postgres psql -U dns_switcher -d dns_switcher -c "
 SELECT id, created_at, actor, action_type, status, dns_target_id,
        previous_datacenter_id, new_datacenter_id, error_message
 FROM audit_log_entries

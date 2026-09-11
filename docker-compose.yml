@@ -6,23 +6,24 @@ services:
     env_file:
       - .env
     environment:
-      DATABASE_URL: postgresql+asyncpg://dns_switcher:dns_switcher@db:5432/dns_switcher
+      DATABASE_URL: postgresql+asyncpg://dns_switcher:dns_switcher@postgres:5432/dns_switcher
     # No host port published on purpose -- this API must only be reachable
     # from other containers on dns-switcher-net (see CLAUDE.md). For local
     # debugging, use `docker compose exec dns-switcher python -c "..."`
     # (see RUNBOOK.md) rather than exposing the port.
     depends_on:
-      db:
+      postgres:
         condition: service_healthy
     networks:
-      - dns-switcher-net
+      - dns-switcher-net # shared with sibling projects (e.g. AloBot)
+      - dns-switcher-internal # this project's own Postgres only
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 10s
       timeout: 5s
       retries: 5
 
-  db:
+  postgres:
     image: postgres:16-alpine
     container_name: dns-switcher-db
     restart: unless-stopped
@@ -32,8 +33,15 @@ services:
       POSTGRES_DB: dns_switcher
     volumes:
       - dns-switcher-db-data:/var/lib/postgresql/data
+    # Deliberately NOT on dns-switcher-net -- no sibling project needs to
+    # reach this database directly, and a generically-named service (e.g.
+    # a sibling project's own "db"/"postgres" service) sharing that network
+    # would otherwise risk exactly the DNS-resolution collision this
+    # isolation avoids: a container on both networks resolving a bare
+    # service name to the WRONG project's Postgres. Learned the hard way --
+    # see RUNBOOK.md.
     networks:
-      - dns-switcher-net
+      - dns-switcher-internal
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U dns_switcher"]
       interval: 5s
@@ -43,6 +51,7 @@ services:
 networks:
   dns-switcher-net:
     name: dns-switcher-net
+  dns-switcher-internal:
 
 volumes:
   dns-switcher-db-data:

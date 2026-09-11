@@ -99,7 +99,7 @@ Environment variables (see `.env.example`):
 - `CLOUDFLARE_API_TOKEN` — Cloudflare API token, Zone:DNS:Edit scope on the
   two managed zones. Never log this value.
 - `DATABASE_URL` — async SQLAlchemy URL, e.g.
-  `postgresql+asyncpg://user:pass@db:5432/dns_switcher`.
+  `postgresql+asyncpg://user:pass@postgres:5432/dns_switcher`.
 - `INTERNAL_API_SHARED_SECRET` — shared secret checked against a header on
   every request from the AloBot container. This API has no other auth layer
   and must never be exposed outside the internal Docker network —
@@ -150,12 +150,14 @@ restricted, the other foreign keys follow this reasoning:
 
 Model and integration tests need a real Postgres (SQLite can't enforce the
 native enum types or the RESTRICT/CASCADE/SET NULL behavior these tests
-verify). Point `TEST_DATABASE_URL` at a scratch database — e.g. run
-`docker compose up -d db` and use
-`postgresql+asyncpg://dns_switcher:dns_switcher@localhost:5432/dns_switcher_test`
-(create that database once with `CREATE DATABASE dns_switcher_test;`, since
-`docker-compose.yml`'s `db` service doesn't publish 5432 to the host by
-default). Each test gets a fresh schema via `create_all`/`drop_all` in
+verify). `docker-compose.yml`'s `postgres` service never publishes a host
+port (by design — see its own comment), so for local test runs spin up a
+throwaway one that does, e.g.
+`docker run -d --rm -e POSTGRES_USER=dns_switcher -e POSTGRES_PASSWORD=dns_switcher -e POSTGRES_DB=dns_switcher -p 5432:5432 postgres:16-alpine`,
+create the test database once (`CREATE DATABASE dns_switcher_test;`), and
+point `TEST_DATABASE_URL` at
+`postgresql+asyncpg://dns_switcher:dns_switcher@localhost:5432/dns_switcher_test`.
+Each test gets a fresh schema via `create_all`/`drop_all` in
 `tests/conftest.py`.
 
 ## Status
